@@ -147,18 +147,27 @@ def test_compile_rejects_remote_refs():
         assert "Remote OpenAPI $ref" in str(exc)
 
 
+def test_path_renderer_percent_encodes_segment_values():
+    connector = compiled().connector
+    rendered, error = connector._render_path(
+        "/records/{record_id}", {"record_id": "abc/123 ?"}
+    )
+    assert error is None
+    assert rendered == "/records/abc%2F123%20%3F"
+
+
 def test_generated_adapter_executes_get_and_post():
     connector = compiled().connector
 
     read = asyncio.run(
         connector.execute(
             "records.read",
-            {"path": {"record_id": "abc/123"}},
+            {"path": {"record_id": "abc-123"}},
             context(),
         )
     )
     assert read.status == "success"
-    assert read.data == {"statusCode": 200, "body": {"id": "abc/123"}}
+    assert read.data == {"statusCode": 200, "body": {"id": "abc-123"}}
 
     created = asyncio.run(
         connector.execute(
