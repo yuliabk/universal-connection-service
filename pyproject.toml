@@ -11,7 +11,8 @@ dependencies = ["fastapi>=0.115,<1", "httpx>=0.27,<1", "pydantic>=2.8,<3", "uvic
 
 [project.optional-dependencies]
 mcp = ["mcp>=2,<3"]
-dev = ["pytest>=8,<9", "mcp>=2,<3"]
+openapi = ["openapi-spec-validator>=0.9,<1", "schemathesis>=4.27,<5"]
+dev = ["pytest>=9,<10", "mcp>=2,<3", "openapi-spec-validator>=0.9,<1", "schemathesis>=4.27,<5"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
