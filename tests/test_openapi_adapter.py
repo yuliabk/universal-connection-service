@@ -1,9 +1,13 @@
 import asyncio
 from copy import deepcopy
+import socket
+import threading
+import time
 from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI
+import uvicorn
 
 from universal_connection_service.contracts import ExecutionContext
 from universal_connection_service.openapi_adapter import compile_openapi_connector
@@ -94,6 +98,14 @@ async def get_record(record_id: str):
 @app.post("/records")
 async def create_record(payload: dict):
     return payload
+
+
+validation_app = FastAPI()
+
+
+@validation_app.get("/healthz", response_model=dict[str, bool])
+async def validation_health():
+    return {"ok": True}
 
 
 def context() -> ExecutionContext:
@@ -245,6 +257,47 @@ def test_schemathesis_runner_uses_bounded_non_stateful_phases(monkeypatch):
     assert command[command.index("--max-examples") + 1] == "3"
     assert "--phases=examples,coverage,fuzzing" in command
     assert "stateful" not in " ".join(command)
+
+
+def test_real_schemathesis_loopback_smoke():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    config = uvicorn.Config(
+        validation_app,
+        host="127.0.0.1",
+        port=port,
+        log_level="error",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        ready = False
+        for _ in range(50):
+            try:
+                response = httpx.get(base_url + "/healthz", timeout=0.2)
+                if response.status_code == 200:
+                    ready = True
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.05)
+        assert ready, "synthetic validation server did not start"
+
+        report = SchemathesisSandboxValidator(max_examples=1, timeout_seconds=30).validate(
+            validation_app.openapi(), base_url
+        )
+        assert report.static_valid is True
+        assert report.dynamic_attempted is True
+        assert report.passed is True
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
 
 
 class PassingValidator:
