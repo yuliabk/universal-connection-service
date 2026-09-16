@@ -30,7 +30,7 @@ ConnectionService יבדוק receipt לפני צריכת אישור שכבר ש�
 ה־Owner ביקש להשלים את פרויקט UCS בהמשך להצגת טיוטת UCS-19. המימוש מתקדם בענף נפרד, קבוצה אחת בכל פעם עם בדיקה לפני המשך.
 
 - [x] G1: חוזים, receipt store, CAS ו־outbox טרנזקציוני בשני backends (001–003, 006–008); הראיות להלן מכסות את שכבת האחסון בלבד.
-- [ ] G2: ConnectionService, אישורים קשורים ובדיקות הרשאה לפני IO (001–005).
+- [x] G2: ConnectionService, אישורים קשורים ובדיקות הרשאה לפני IO (001–005); היקף וראיות להלן. reconciliation ומוכנות Production עדיין פתוחים.
 - [ ] G3: recovery, auto-connect, audit delivery וגבולות retention/retry (004–007).
 - [ ] G4: fault injection בין תהליכים, רגרסיה, ראיות ומגבלות מסירה (008).
 
@@ -71,3 +71,20 @@ Migration 5 מוסיף operation/digest/revocation ל־approval_grant וטבלת
 successIsFinal הוא חוזה מפעיל מאושר, לא רמז מהמודל או MCP annotation. ללא חוזה זה dispatch חסום. תוצאה שאינה success או exception אחרי dispatch נשארת unknown; אין retries אוטומטיים ב־G2. Timeout/cancellation אינם הוכחת אי־ביצוע. outcome עמום ב־auto-connect נכנס ל־awaiting_reconciliation עם nextAction=reconcile_execution, ואינו מציע restart. מימוש בירור בפועל יתווסף ב־G3.
 
 auditId סופי מצביע לאירוע outbox; לפני completion, receiptId משמש גם כאסמכתת הכוונה העמידה בשדה auditId. כשל לפני הכנת receipt אינו ראיית ביצוע. G3 ישלים מסירת outbox ל־audit store ונתיב status/reconciliation מורשה.
+
+## ראיות G2 — 2026-09-16
+
+Commit `e69d5db991681e49570151d068790bca053cef69` עבר [CI עם PostgreSQL 16 ו־Docker](https://github.com/yuliabk/universal-connection-service/actions/runs/35121423682): 186 בדיקות עברו ללא דילוגים. בבדיקה המקומית המלאה לפני תוספת שלוש בדיקות התחרות/expiry עברו 141 בדיקות ו־39 דולגו בשל העדר PostgreSQL/Docker; לאחר התוספת, 23 בדיקות durable execution מקומיות עברו ו־21 בדיקות PostgreSQL באותו קובץ דולגו מקומית ונבדקו ב־CI.
+
+הראיות החדשות כוללות: החזרת אותה תוצאה מוצפנת אחרי פתיחת store/service חדשים; אישור קשור ל־digest ול־operation; חסימת grants ישנים, scope mismatch, expiry ו־revocation; rollback של consume כשכתיבת attempt נכשלת; בדיקת actor/policy לפני החזרת תוצאה; סיבוב מפתח ופג תוקף payload בלי שחרור operationId; חשבון credential שונה; שני מופעי שירות שמייצרים השפעה אחת; ואובדן acknowledgement אחרי commit הצלחה, שאחריו אותו retry מחזיר את התוצאה השמורה.
+
+בדיקת crash מפעילה תהליך Python נפרד: המחבר הסינתטי מבצע commit ב־database ספק נפרד, ואז os._exit(42) לפני completion ב־UCS. פתיחת UCS מחדש מחזירה OUTCOME_UNKNOWN, אינה מפעילה מחבר נוסף, ומונה ההשפעות נשאר 1. זו הוכחת חסימת כפילות; הכרעת unknown באמצעות lookup/replay מוגן עדיין שייכת ל־G3.
+
+## G3 — העבודה הבאה
+
+1. Provider recovery contract מהימן עם provenance/revision, אופן העברת providerKey לספק מהניסיון הראשון, חלון deduplication וגבולות attempts/deadline. receipts של G2 שלא נשלחו עם מפתח ספק מאומת לא יקבלו replay רק משום שנוספה תצורה חדשה.
+2. reconciliation מורשה עם בדיקת account/actor/policy מחדש, הבחנה בין pending/unknown/תוצאה סופית, ו־lookup שאינו מניח ש־not found פירושו שאין השפעה. lease/fencing מקומי אינו אישור ל־retry.
+3. מסירת outbox idempotent ל־AuditStore עם אותו eventId, תוך השארת הצלחה עמידה גם כשמסירת audit נכשלת.
+4. חידוש auto-connect דרך receipt קיימת אחרי crash לפני שמירת workflow, ללא בקשת אישור חדשה לצורך קריאת תוצאה קיימת. status/reconciliation יישארו tenant/actor scoped.
+5. מחיקת payload תוך שמירת tombstone, quarantine ל־restore שאיבד receipts, תקציב reconciliation, וראיות בין תהליכים גם למסלול התאוששות מלא.
+6. ביקורת G4 תסגור גם סיווג capabilities מהימן בכל המתאמים, timeout/cancellation, worker ישן שחוזר לפעול אחרי החלפת בעלות, ומטריצת דרישות מלאה. אין לסמן הפרויקט או UCS-19 כהושלמו לפני כן.
