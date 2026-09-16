@@ -3,8 +3,9 @@ from __future__ import annotations
 import contextvars
 import json
 import subprocess
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
+from uuid import uuid4
 
 from pydantic import Field, field_validator
 
@@ -26,7 +27,7 @@ class SandboxGatewayError(RuntimeError):
 
 class DockerSandboxGatewayConfig(Model):
     docker_executable: str = Field(alias="dockerExecutable", default="docker", min_length=1)
-    network_name: str = Field(alias="networkName", default="ucs-sandbox-egress", min_length=1)
+    network_name: str = Field(alias="networkName", default="ucs-sandbox-egress", min_length=1, max_length=40)
     gateway_container: str = Field(alias="gatewayContainer", min_length=1)
     gateway_alias: str = Field(alias="gatewayAlias", default="agent-vault-proxy", min_length=1)
     startup_timeout_seconds: float = Field(alias="startupTimeoutSeconds", default=5.0, gt=0, le=30)
@@ -47,9 +48,10 @@ class SandboxGatewayStatus(Model):
 
 
 class DockerSandboxGatewayManager:
-    """Idempotently create an internal bridge and attach an existing broker container."""
+    """Create an ephemeral internal network for each privileged execution."""
 
     NETWORK_LABEL = "io.universal-connection-service.sandbox-gateway"
+    LEASE_LABEL = "io.universal-connection-service.sandbox-gateway-lease"
 
     def __init__(self, config: DockerSandboxGatewayConfig) -> None:
         self.config = config
@@ -70,47 +72,7 @@ class DockerSandboxGatewayManager:
                 retryable=True,
             ) from None
 
-    def _network_exists(self) -> bool:
-        return self._run(["network", "inspect", self.config.network_name]).returncode == 0
-
-    def _create_network(self) -> None:
-        completed = self._run([
-            "network", "create",
-            "--driver", "bridge",
-            "--internal",
-            "--label", f"{self.NETWORK_LABEL}=true",
-            self.config.network_name,
-        ])
-        if completed.returncode != 0:
-            # A concurrent UCS instance may have created the same network after our existence check.
-            if not self._network_exists():
-                raise SandboxGatewayError(
-                    "SANDBOX_GATEWAY_NETWORK_CREATE_FAILED",
-                    "Managed sandbox gateway network could not be created",
-                    retryable=True,
-                )
-
-    def _verify_network(self) -> None:
-        internal = self._run([
-            "network", "inspect", self.config.network_name,
-            "--format", "{{.Internal}}",
-        ])
-        driver = self._run([
-            "network", "inspect", self.config.network_name,
-            "--format", "{{.Driver}}",
-        ])
-        if internal.returncode != 0 or internal.stdout.strip().lower() != "true":
-            raise SandboxGatewayError(
-                "SANDBOX_GATEWAY_NETWORK_INVALID",
-                "Managed sandbox gateway network must be internal",
-            )
-        if driver.returncode != 0 or driver.stdout.strip().lower() != "bridge":
-            raise SandboxGatewayError(
-                "SANDBOX_GATEWAY_NETWORK_INVALID",
-                "Managed sandbox gateway network must use the bridge driver",
-            )
-
-    def _container_networks(self) -> dict[str, Any]:
+    def _gateway_networks(self) -> dict[str, Any]:
         running = self._run([
             "inspect", self.config.gateway_container,
             "--format", "{{.State.Running}}",
@@ -140,55 +102,104 @@ class DockerSandboxGatewayManager:
             ) from None
         return payload if isinstance(payload, dict) else {}
 
-    def _attach_gateway(self) -> None:
-        networks = self._container_networks()
-        current = networks.get(self.config.network_name)
-        if current is None:
-            connected = self._run([
-                "network", "connect",
-                "--alias", self.config.gateway_alias,
-                self.config.network_name,
-                self.config.gateway_container,
-            ])
-            if connected.returncode != 0:
-                # Re-read state to tolerate another UCS instance connecting it concurrently.
-                networks = self._container_networks()
-                current = networks.get(self.config.network_name)
-                if current is None:
-                    raise SandboxGatewayError(
-                        "SANDBOX_GATEWAY_CONNECT_FAILED",
-                        "Sandbox gateway container could not be attached to the managed network",
-                        retryable=True,
-                    )
-            else:
-                networks = self._container_networks()
-                current = networks.get(self.config.network_name)
+    def ensure(self) -> SandboxGatewayStatus:
+        docker = self._run(["version", "--format", "{{.Server.Version}}"])
+        if docker.returncode != 0 or not docker.stdout.strip():
+            raise SandboxGatewayError(
+                "SANDBOX_GATEWAY_DOCKER_UNAVAILABLE",
+                "Docker sandbox gateway runtime is unavailable",
+                retryable=True,
+            )
+        self._gateway_networks()
+        return SandboxGatewayStatus(
+            ready=True,
+            network=f"{self.config.network_name}-*",
+            gatewayAlias=self.config.gateway_alias,
+            code="SANDBOX_GATEWAY_READY",
+        )
+
+    def _network_name(self) -> str:
+        return f"{self.config.network_name}-{uuid4().hex[:12]}"
+
+    def _create_network(self, network: str) -> None:
+        completed = self._run([
+            "network", "create",
+            "--driver", "bridge",
+            "--internal",
+            "--label", f"{self.NETWORK_LABEL}=true",
+            "--label", f"{self.LEASE_LABEL}=true",
+            network,
+        ])
+        if completed.returncode != 0:
+            raise SandboxGatewayError(
+                "SANDBOX_GATEWAY_NETWORK_CREATE_FAILED",
+                "Ephemeral sandbox gateway network could not be created",
+                retryable=True,
+            )
+
+    def verify_network(self, network: str) -> None:
+        internal = self._run(["network", "inspect", network, "--format", "{{.Internal}}"])
+        driver = self._run(["network", "inspect", network, "--format", "{{.Driver}}"])
+        managed = self._run([
+            "network", "inspect", network,
+            "--format", f'{{{{ index .Labels "{self.NETWORK_LABEL}" }}}}',
+        ])
+        lease = self._run([
+            "network", "inspect", network,
+            "--format", f'{{{{ index .Labels "{self.LEASE_LABEL}" }}}}',
+        ])
+        if internal.returncode != 0 or internal.stdout.strip().lower() != "true":
+            raise SandboxGatewayError("SANDBOX_GATEWAY_NETWORK_INVALID", "Sandbox gateway lease network must be internal")
+        if driver.returncode != 0 or driver.stdout.strip().lower() != "bridge":
+            raise SandboxGatewayError("SANDBOX_GATEWAY_NETWORK_INVALID", "Sandbox gateway lease network must use bridge driver")
+        if managed.returncode != 0 or managed.stdout.strip().lower() != "true":
+            raise SandboxGatewayError("SANDBOX_GATEWAY_NETWORK_INVALID", "Sandbox gateway lease network is not UCS-managed")
+        if lease.returncode != 0 or lease.stdout.strip().lower() != "true":
+            raise SandboxGatewayError("SANDBOX_GATEWAY_NETWORK_INVALID", "Sandbox gateway network is not an execution lease")
+
+    def _attach_gateway(self, network: str) -> None:
+        connected = self._run([
+            "network", "connect",
+            "--alias", self.config.gateway_alias,
+            network,
+            self.config.gateway_container,
+        ])
+        if connected.returncode != 0:
+            raise SandboxGatewayError(
+                "SANDBOX_GATEWAY_CONNECT_FAILED",
+                "Sandbox gateway container could not be attached to the execution network",
+                retryable=True,
+            )
+        current = self._gateway_networks().get(network)
         if not isinstance(current, dict):
             raise SandboxGatewayError(
                 "SANDBOX_GATEWAY_CONNECT_FAILED",
-                "Sandbox gateway container is not attached to the managed network",
+                "Sandbox gateway container is not attached to the execution network",
                 retryable=True,
             )
         aliases = current.get("Aliases")
         aliases = aliases if isinstance(aliases, list) else []
-        # Docker DNS always exposes the container name; an explicit different alias must be present.
         if self.config.gateway_alias != self.config.gateway_container and self.config.gateway_alias not in aliases:
             raise SandboxGatewayError(
                 "SANDBOX_GATEWAY_ALIAS_MISMATCH",
                 "Sandbox gateway container is attached without the configured network alias",
             )
 
-    def ensure(self) -> SandboxGatewayStatus:
-        if not self._network_exists():
-            self._create_network()
-        self._verify_network()
-        self._attach_gateway()
-        return SandboxGatewayStatus(
-            ready=True,
-            network=self.config.network_name,
-            gatewayAlias=self.config.gateway_alias,
-            code="SANDBOX_GATEWAY_READY",
-        )
+    def _cleanup(self, network: str) -> None:
+        self._run(["network", "disconnect", "-f", network, self.config.gateway_container])
+        self._run(["network", "rm", network])
+
+    @contextmanager
+    def lease(self):
+        self.ensure()
+        network = self._network_name()
+        self._create_network(network)
+        try:
+            self.verify_network(network)
+            self._attach_gateway(network)
+            yield network
+        finally:
+            self._cleanup(network)
 
 
 class _ToolScopedProfileAdapter:
@@ -217,7 +228,7 @@ class _ToolScopedProfileAdapter:
 
 
 class ManagedPolicyDockerMCPBSandboxRunner(DockerMCPBSandboxRunner):
-    """UCS-15 runner plus managed gateway repair and per-capability profile selection."""
+    """UCS-15 runner with per-capability policy and isolated gateway network leases."""
 
     def __init__(
         self,
@@ -229,8 +240,13 @@ class ManagedPolicyDockerMCPBSandboxRunner(DockerMCPBSandboxRunner):
         credential_broker,
         gateway_manager: DockerSandboxGatewayManager | None = None,
     ) -> None:
+        self.policy_service = policy_service
         self.tool_profile_adapter = _ToolScopedProfileAdapter(policy_service)
         self.gateway_manager = gateway_manager
+        self._leased_network: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+            "ucs_sandbox_gateway_network",
+            default=None,
+        )
         super().__init__(
             artifact_source,
             config,
@@ -241,16 +257,17 @@ class ManagedPolicyDockerMCPBSandboxRunner(DockerMCPBSandboxRunner):
 
     def _require_internal_network(self) -> str:
         if self.gateway_manager is not None:
+            network = self._leased_network.get()
+            if network is None:
+                raise MCPBSandboxError(
+                    "SANDBOX_GATEWAY_LEASE_REQUIRED",
+                    "Privileged sandbox execution requires an isolated gateway network lease",
+                )
             try:
-                status = self.gateway_manager.ensure()
+                self.gateway_manager.verify_network(network)
             except SandboxGatewayError as exc:
                 raise MCPBSandboxError(exc.code, exc.safe_message, retryable=exc.retryable) from None
-            if self.config.egress_network != status.network:
-                raise MCPBSandboxError(
-                    "SANDBOX_GATEWAY_CONFIG_MISMATCH",
-                    "Managed sandbox gateway network does not match runner configuration",
-                )
-            return status.network
+            return network
         return super()._require_internal_network()
 
     @asynccontextmanager
@@ -264,15 +281,39 @@ class ManagedPolicyDockerMCPBSandboxRunner(DockerMCPBSandboxRunner):
         version: str,
         ctx: ExecutionContext,
     ):
+        profile = self.policy_service.active_profile(
+            ctx.organization_id,
+            connector_id,
+            version,
+            capability,
+        )
         async with self.tool_profile_adapter.capability(capability):
-            async with self.client(
-                digest,
-                service_id=service_id,
-                connector_id=connector_id,
-                version=version,
-                ctx=ctx,
-            ) as client:
-                yield client
+            if self.gateway_manager is not None and profile.egress_hosts:
+                try:
+                    with self.gateway_manager.lease() as network:
+                        token = self._leased_network.set(network)
+                        try:
+                            async with self.client(
+                                digest,
+                                service_id=service_id,
+                                connector_id=connector_id,
+                                version=version,
+                                ctx=ctx,
+                            ) as client:
+                                yield client
+                        finally:
+                            self._leased_network.reset(token)
+                except SandboxGatewayError as exc:
+                    raise MCPBSandboxError(exc.code, exc.safe_message, retryable=exc.retryable) from None
+            else:
+                async with self.client(
+                    digest,
+                    service_id=service_id,
+                    connector_id=connector_id,
+                    version=version,
+                    ctx=ctx,
+                ) as client:
+                    yield client
 
 
 class ToolScopedSandboxedMCPConnector(SandboxedMCPConnector):
