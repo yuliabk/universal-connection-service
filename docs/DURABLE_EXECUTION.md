@@ -29,9 +29,25 @@ ConnectionService יבדוק receipt לפני צריכת אישור שכבר ש�
 
 ה־Owner ביקש להשלים את פרויקט UCS בהמשך להצגת טיוטת UCS-19. המימוש מתקדם בענף נפרד, קבוצה אחת בכל פעם עם בדיקה לפני המשך.
 
-- [ ] G1: חוזים, receipt store, CAS ו־outbox טרנזקציוני בשני backends (001–003, 006–008).
+- [x] G1: חוזים, receipt store, CAS ו־outbox טרנזקציוני בשני backends (001–003, 006–008); הראיות להלן מכסות את שכבת האחסון בלבד.
 - [ ] G2: ConnectionService, אישורים קשורים ובדיקות הרשאה לפני IO (001–005).
 - [ ] G3: recovery, auto-connect, audit delivery וגבולות retention/retry (004–007).
 - [ ] G4: fault injection בין תהליכים, רגרסיה, ראיות ומגבלות מסירה (008).
 
 העלויות הן כתיבות database וקריאות reconciliation מוגבלות. מוכנות Production אינה נובעת ממעבר בדיקות יחידה; היא דורשת גם contract של ספק, פריסה, הצפנה ו־restore מוכחים. בשלב הבנייה משתמשים בנתונים וספקים סינתטיים בלבד.
+
+## ראיות G1 — 2026-09-16
+
+קוד האחסון נבדק ב־commit `a115c8e1122cb339ea39acfdd54351f5bee35f57`. [הרצת CI](https://github.com/yuliabk/universal-connection-service/actions/runs/35116819315) עברה עם PostgreSQL 16 ו־Docker: 141 בדיקות עברו. מקומית עברו 120 בדיקות ו־21 דולגו בהעדר PostgreSQL/Docker; נדרשו PATH של הסביבה המבודדת ו־PYTHONUTF8=1 עבור Schemathesis ב־Windows. התקלה המקומית לא דרשה שינוי בקוד השירות.
+
+בדיקות `tests/test_receipts.py` מכסות מפתח יציב בפתיחה מחדש, binding conflicts, תחרות CAS בין שני מופעי backend, חסימת dispatch חוזר מ־unknown, completion/outbox אטומיים, tenant isolation, acknowledgement חוזר, rollback בכשל outbox ואובדן acknowledgement של commit. בדיקת SQLite בתהליך נפרד משתמשת ב־os._exit לאחר dispatch commit ומוודאת שלא ניתן לבצע dispatch חדש. בדיקות PostgreSQL רצות מול שרת אמיתי ב־CI. בדיקת workflow ישנה עודכנה כדי לא לקבע את גרסת הסכימה ל־3 לאחר הוספת migration 4.
+
+עדיין אין חיבור ל־ConnectionService או הגנה פעילה על פעולות עסקיות. בדיקת התהליך ב־G1 מוכיחה עמידות dispatch בלבד; היא אינה מוכיחה התאוששות לאחר השפעת ספק, שתיבדק ב־G4. אין עדיין consumer ל־outbox, result encryption, קשירת approval ל־operation, retries מוגני ספק, retention או recovery workflow. אין טענת השלמת UCS-19.
+
+## סדר G2 הבא
+
+1. הרחבת ConnectionRequest ב־operationId ו־ConnectionResult ב־receiptId/executionState.
+2. operation/digest binding של approvals ומעבר מתועד מ־grants ישנים; צריכה אטומית עם receipt ב־SQLite/PostgreSQL. אישור של פעולה אחרת לא יוכל לשמש לפעולה עמומה.
+3. coordinator מהימן שיבדוק policy ו־actor לפני גישה לתוצאה, ויחייב durable store לכל פעולה בעלת השפעה. cached success לא יצרוך approval שוב; unknown לא יבצע connector.execute רגיל.
+4. result storage מוצפן, completion אטומי, ומבחני כשל לפני/אחרי IO. memory mode ו־backend חסר לא יוכלו להפעיל write דרך מסלול legacy.
+5. בדיקות והרצת רגרסיה לפני G3; לשמור את PR #19 כטיוטה עד סגירת כל הקבוצות.
