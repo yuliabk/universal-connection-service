@@ -25,12 +25,20 @@ from .credentials import AgentVaultCredentialResolver, AgentVaultCredentialResol
 from .discovery import DiscoveryEngine, MCPRegistryConfig, MCPRegistryDiscoveryProvider
 from .mcp_adapter import MCPConnectorAdapter
 from .mcp_validation import MCPValidationService
+from .mcpb_sandbox import DockerMCPBSandboxConfig, DockerMCPBSandboxRunner, SandboxedMCPConnector
 from .openapi_adapter import OpenAPIConnectorAdapter
 from .packages import ConnectorPackageLoader, CosignBundleVerifier, Ed25519PackageVerifier, FilesystemPackageSource
 from .persistence import SQLiteStateStore, WorkflowStore
 from .postgres_store import PostgresStateStore, config_from_env
 from .registry import ConnectorRegistry
 from .rehydration import ConnectorRuntimeRehydrator, RehydrationReport
+from .sandbox_build import (
+    FilesystemMCPBArtifactStore,
+    GeneratedSandboxMCPPackageBuilder,
+    SandboxAwareBuildCoordinator,
+    SandboxBuildAwareAutoConnectOrchestrator,
+    SandboxMCPPackageAcquirer,
+)
 from .service import ConnectionService
 
 
@@ -114,10 +122,11 @@ def _signing_public_key(signing_key_b64: str) -> bytes:
 def _build_package_runtime():
     root = os.getenv("UCS_CONNECTOR_PACKAGE_DIR")
     if not root:
-        return None, None, "disabled"
+        return None, None, None, "disabled"
     mode = os.getenv("UCS_PACKAGE_VERIFIER", "ed25519").strip().lower()
     source = FilesystemPackageSource(root)
-    builder = None
+    openapi_builder = None
+    sandbox_builder = None
     if mode == "ed25519":
         raw_keys = os.getenv("UCS_PACKAGE_ED25519_KEYS_JSON")
         signing_key = os.getenv("UCS_PACKAGE_ED25519_SIGNING_KEY")
@@ -136,10 +145,10 @@ def _build_package_runtime():
             raise RuntimeError("Ed25519 package verification requires public keys or a build signing key")
         verifier = Ed25519PackageVerifier(keys)
         if signing_key:
-            builder = GeneratedOpenAPIPackageBuilder(
-                FilesystemPackageWriter(root),
-                Ed25519BuildSigner(signer_ref=signer_ref, private_key=signing_key),
-            )
+            writer = FilesystemPackageWriter(root)
+            signer = Ed25519BuildSigner(signer_ref=signer_ref, private_key=signing_key)
+            openapi_builder = GeneratedOpenAPIPackageBuilder(writer, signer)
+            sandbox_builder = GeneratedSandboxMCPPackageBuilder(writer, signer)
     elif mode == "sigstore":
         identity = os.getenv("UCS_PACKAGE_SIGSTORE_IDENTITY")
         issuer = os.getenv("UCS_PACKAGE_SIGSTORE_ISSUER")
@@ -152,10 +161,32 @@ def _build_package_runtime():
         )
     else:
         raise RuntimeError("UCS_PACKAGE_VERIFIER must be ed25519 or sigstore")
-    return ConnectorPackageLoader(source, verifier), builder, mode
+    return ConnectorPackageLoader(source, verifier), openapi_builder, sandbox_builder, mode
+
+
+def _build_sandbox_runner(artifact_store):
+    if not _env_bool("UCS_MCP_PACKAGE_SANDBOX_ENABLED"):
+        return None, "disabled"
+    if artifact_store is None:
+        raise RuntimeError("UCS_BUILD_ARTIFACT_DIR is required when MCP package sandboxing is enabled")
+    config = DockerMCPBSandboxConfig(
+        dockerExecutable=os.getenv("UCS_MCP_SANDBOX_DOCKER", "docker"),
+        pythonImage=os.getenv("UCS_MCP_SANDBOX_PYTHON_IMAGE", "python:3.12-slim"),
+        nodeImage=os.getenv("UCS_MCP_SANDBOX_NODE_IMAGE", "node:22-bookworm-slim"),
+        memoryLimit=os.getenv("UCS_MCP_SANDBOX_MEMORY", "256m"),
+        cpuLimit=float(os.getenv("UCS_MCP_SANDBOX_CPUS", "1")),
+        pidsLimit=int(os.getenv("UCS_MCP_SANDBOX_PIDS", "64")),
+        tmpfsBytes=int(os.getenv("UCS_MCP_SANDBOX_TMPFS_BYTES", str(64 * 1024 * 1024))),
+        startupTimeoutSeconds=float(os.getenv("UCS_MCP_SANDBOX_STARTUP_TIMEOUT", "5")),
+    )
+    return DockerMCPBSandboxRunner(artifact_store, config), "docker"
 
 
 def _bind_runtime_connector(connector):
+    if isinstance(connector, SandboxedMCPConnector):
+        if mcp_sandbox_runner is None:
+            raise RuntimeError("trusted sandboxed MCP connector cannot rehydrate without the configured sandbox runtime")
+        return connector.with_runner(mcp_sandbox_runner)
     if credential_resolver is None:
         return connector
     if isinstance(connector, OpenAPIConnectorAdapter):
@@ -170,7 +201,7 @@ openapi_catalog = _build_openapi_catalog()
 discovery_engine, discovery_kind = _build_discovery_engine(openapi_catalog)
 control_plane_authenticator, control_plane_kind = _build_control_plane_authenticator()
 credential_resolver, credential_broker_kind = _build_credential_resolver()
-package_loader, generated_package_builder, package_kind = _build_package_runtime()
+package_loader, generated_package_builder, generated_sandbox_package_builder, package_kind = _build_package_runtime()
 registry = ConnectorRegistry(state_store=state_store)
 approval_store = state_store if isinstance(state_store, ApprovalStore) else None
 workflow_store = state_store if isinstance(state_store, WorkflowStore) else None
@@ -197,9 +228,10 @@ control_plane_service = ControlPlaneService(
     require_distinct_approver=_env_bool("UCS_CONTROL_PLANE_REQUIRE_DISTINCT_APPROVER"),
 )
 artifact_dir = os.getenv("UCS_BUILD_ARTIFACT_DIR")
-mcp_package_acquirer = MCPPackageAcquirer(
-    FilesystemBuildArtifactStore(artifact_dir) if artifact_dir else None
-)
+generic_artifact_store = FilesystemBuildArtifactStore(artifact_dir) if artifact_dir else None
+mcpb_artifact_store = FilesystemMCPBArtifactStore(artifact_dir) if artifact_dir else None
+mcp_sandbox_runner, mcp_sandbox_kind = _build_sandbox_runner(mcpb_artifact_store)
+mcp_package_acquirer = MCPPackageAcquirer(generic_artifact_store)
 build_pipeline = ConnectorBuildPipeline(
     registry=registry,
     evidence_store=state_store,
@@ -213,9 +245,22 @@ build_coordinator = VerifiedBuildCoordinator(
     package_loader=package_loader,
     evidence_store=state_store,
 )
-auto_connect_orchestrator = (
-    BuildAwareAutoConnectOrchestrator(
-        build_coordinator=build_coordinator,
+if mcp_sandbox_runner is not None and mcpb_artifact_store is not None:
+    sandbox_build_coordinator = SandboxAwareBuildCoordinator(
+        fallback=build_coordinator,
+        runner=mcp_sandbox_runner,
+        acquirer=SandboxMCPPackageAcquirer(mcpb_artifact_store),
+        package_builder=generated_sandbox_package_builder,
+        package_loader=package_loader,
+        registry=registry,
+        evidence_store=state_store,
+    )
+else:
+    sandbox_build_coordinator = None
+
+auto_connect_orchestrator = None
+if workflow_store is not None:
+    common = dict(
         workflow_store=workflow_store,
         connection_service=service,
         control_plane_service=control_plane_service,
@@ -223,11 +268,31 @@ auto_connect_orchestrator = (
         approval_store=approval_store,
         evidence_store=state_store,
     )
-    if workflow_store is not None
-    else None
+    if sandbox_build_coordinator is not None:
+        auto_connect_orchestrator = SandboxBuildAwareAutoConnectOrchestrator(
+            build_coordinator=sandbox_build_coordinator,
+            **common,
+        )
+    else:
+        auto_connect_orchestrator = BuildAwareAutoConnectOrchestrator(
+            build_coordinator=build_coordinator,
+            **common,
+        )
+
+auto_connect_kind = (
+    "persistent+build+mcpb-sandbox"
+    if auto_connect_orchestrator is not None and mcp_sandbox_runner is not None
+    else "persistent+build"
+    if auto_connect_orchestrator is not None
+    else "disabled"
 )
-auto_connect_kind = "persistent+build" if auto_connect_orchestrator is not None else "disabled"
-build_kind = "openapi+package-acquisition" if auto_connect_orchestrator is not None else "disabled"
+build_kind = (
+    "openapi+mcpb-docker"
+    if mcp_sandbox_runner is not None
+    else "openapi+package-acquisition"
+    if auto_connect_orchestrator is not None
+    else "disabled"
+)
 package_rehydration = RehydrationReport()
 
 
@@ -270,6 +335,7 @@ def health():
         "autoConnect": auto_connect_kind,
         "buildPipeline": build_kind,
         "packageVerifier": package_kind,
+        "packageSandbox": mcp_sandbox_kind,
         "packages": {
             "loaded": package_rehydration.loaded,
             "skipped": package_rehydration.skipped,
