@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from .approvals import ApprovalStore, PersistentApprovalVerifier
 from .contracts import ConnectionPlan, ConnectionRequest, ConnectionResult, ExecutionContext
+from .discovery import DiscoveryEngine, MCPRegistryConfig, MCPRegistryDiscoveryProvider
 from .packages import (
     ConnectorPackageLoader,
     CosignBundleVerifier,
@@ -19,6 +20,13 @@ from .rehydration import ConnectorRuntimeRehydrator, RehydrationReport
 from .service import ConnectionService
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _build_state_store():
     if os.getenv("UCS_DATABASE_URL"):
         return PostgresStateStore(config_from_env()), "postgres"
@@ -26,6 +34,19 @@ def _build_state_store():
     if path:
         return SQLiteStateStore(path), "sqlite"
     return None, "memory"
+
+
+def _build_discovery_engine():
+    if not _env_bool("UCS_MCP_REGISTRY_ENABLED"):
+        return None, "disabled"
+    config = MCPRegistryConfig(
+        baseUrl=os.getenv("UCS_MCP_REGISTRY_URL", "https://registry.modelcontextprotocol.io"),
+        timeoutSeconds=float(os.getenv("UCS_MCP_REGISTRY_TIMEOUT_SECONDS", "4")),
+        pageSize=int(os.getenv("UCS_MCP_REGISTRY_PAGE_SIZE", "20")),
+        maxPages=int(os.getenv("UCS_MCP_REGISTRY_MAX_PAGES", "2")),
+        cacheTtlSeconds=int(os.getenv("UCS_MCP_REGISTRY_CACHE_TTL_SECONDS", "3600")),
+    )
+    return DiscoveryEngine((MCPRegistryDiscoveryProvider(config),)), "mcp_registry"
 
 
 def _package_loader_from_env():
@@ -61,6 +82,7 @@ def _package_loader_from_env():
 
 
 state_store, state_kind = _build_state_store()
+discovery_engine, discovery_kind = _build_discovery_engine()
 registry = ConnectorRegistry(state_store=state_store)
 approval_verifier = (
     PersistentApprovalVerifier(state_store)
@@ -72,6 +94,7 @@ service = ConnectionService(
     approval_verifier=approval_verifier,
     audit_store=state_store,
     evidence_store=state_store,
+    discovery_engine=discovery_engine,
 )
 package_rehydration = RehydrationReport()
 
@@ -111,6 +134,7 @@ def health():
         "ok": True,
         "version": "0.1.0",
         "state": state_kind,
+        "discovery": discovery_kind,
         "packages": {
             "loaded": package_rehydration.loaded,
             "skipped": package_rehydration.skipped,
