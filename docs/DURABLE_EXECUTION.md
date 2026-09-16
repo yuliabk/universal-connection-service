@@ -17,7 +17,7 @@
 
 ## תכנון
 
-ReceiptStore הוא port נוסף. SQLiteStateStore ו־PostgresStateStore יממשו את אותו חוזה; PostgreSQL מקבל migration ממוספר, ו־SQLite הרחבה additive. אין שירות תשתית חדש. מצב memory אינו עמיד לפעולות אלה.
+ReceiptStore הוא port נוסף. SQLiteStateStore ו־PostgresStateStore מממשים את אותו חוזה; PostgreSQL מקבל migration ממוספר, ו־SQLite הרחבה additive. הגנת restore מוסיפה מסד witness עצמאי שחייב להישמר בנפרד מגיבויי primary. המחיר הוא כתיבת commit נוספת לפני כל dispatch, אחסון רישום הניסיונות וגיבוי עצמאי. מצב memory אינו עמיד לפעולות אלה.
 
 binding הוא hash של JSON קנוני הכולל version, organization, user/agent, שירות, חשבון ספק, capability, operation ופרמטרים. הוא אינו ciphertext ואינו מיועד ללוג משותף. operationId אינו hash של input: שתי פעולות מכוונות עם אותם פרמטרים יכולות להיות שונות. transport וגרסת credential אינם זהות עסקית.
 
@@ -136,3 +136,20 @@ digest החוזה נשמר בכוונה לפני dispatch. הקריאה הראש
 בדיקות SQLite/PostgreSQL משתמשות בספק סינתטי עם database נפרד ורשומת dedup אטומית: אחרי commit ותשובה שאבדה, replay מחזיר את האפקט המקורי, והמונה נשאר 1. נבדקים workers מקבילים, פתיחת אחסון מחדש, מפתח ו־deadline יציבים, אישור חסר/אחר/revoked/expired, budget שנצרך גם באובדן commit acknowledgement, scope נפרד ומניעת יצירת פעולה חדשה דרך replay. בדיקת בקשה מאוחרת מפנה במפורש את מטמון dedup של הספק ומוכיחה ש־notAfter עדיין מונע אפקט נוסף. אין בשינוי אימות של ספק Production אמיתי; הפעלת חוזה עבורו דורשת ראיות המותאמות למתאם ולגרסה.
 
 G3 עדיין פתוח עבור restore quarantine. G4 עדיין כולל cancellation, בדיקות תהליכים ועובדים ישנים נוספות, סיווג effects מהימן בכל המתאמים וביקורת מטריצת הדרישות.
+
+### G3 — הגנה משחזור באמצעות dispatch witness עצמאי
+
+DurableExecutor מחייב כעת DispatchWitness במסד נתונים נפרד. לאחר commit של attempt ב־UCS ולפני IO לספק נכתבת רשומת witness בלתי משתנה עם tenant/operation, receipt, מפתח ספק, binding, חוזה, אישור hashed, מספר ניסיון ו־deadline. אין payload או credentials ברישום. רק acknowledgement של הכתיבה מאפשר להתקדם לספק. כשל או אובדן acknowledgement משאירים את הניסיון עמום ללא קריאה נוספת לספק.
+
+לפני גישה ל־receipt ולפני כל dispatch נבדקת התאמה לרישום העצמאי. receipt שנעלמה, חזרה ל־prepared, איבדה ניסיונות או השתנתה ביחס ל־witness מקבלת EXECUTION_RESTORE_QUARANTINED. אישור חדש אינו משחרר את operationId. רישום dispatch כפול או קפיצה במספרי attempts נחסמים. זהו fail-closed גם כאשר primary commit נשמר אך witness commit נכשל; זמינות הפעולה יכולה להידרש לבירור תפעולי. אין endpoint שמוחק witness או מסיר quarantine.
+
+הגדרות host הנדרשות בנוסף ל־targets/keyring:
+- `UCS_EXECUTION_WITNESS_ID`: מזהה קבוע של הרישום העצמאי, נשמר גם בתצורת המארח מחוץ לגיבויי UCS.
+- עבור SQLite: `UCS_EXECUTION_WITNESS_PATH` לקובץ קיים נפרד; אותו קובץ או hard link למסד הראשי נדחים.
+- עבור PostgreSQL: `UCS_EXECUTION_WITNESS_POSTGRES_URL` למסד קיים נפרד. אותו server/database נדחה, גם דרך שני connection pools. מארח PostgreSQL אינו מקבל witness SQLite מקומי, כדי לא לפצל את הרישום בין replicas.
+
+הפעלה אינה יוצרת witness חסר ואינה משנה את זהותו. provisioning נעשה במפורש עבור keyspace חדש בלבד, באמצעות `python -m universal_connection_service.dispatch_witness --sqlite-path <new-path> --witness-id <deployment-id> --confirm-new-keyspace`, או `--postgres-env <environment-variable-name>` במקום נתיב SQLite. ב־PostgreSQL מסד witness ייעודי חייב להיות קיים; פקודת provisioning יוצרת בו את הסכימה. DSN מועבר דרך משתנה סביבה ולא כארגומנט שמופיע ברשימת תהליכים. provisioning חוזר אינו מאפס מסד קיים. אין להשתמש בפקודה כפתרון ל־quarantine או כאמצעי לשדרוג keyspace היסטורי ללא רישום dispatch מוסמך.
+
+גבול התפעול מחייב: witness אינו נכלל בשחזור גיבוי primary, ואסור להחזירו לאחור יחד עם UCS. הפרדת שמות database אינה הוכחה להפרדת failure domains; הפריסה חייבת לשמור ולגבות את witness בנפרד ולוודא שהוא עדכני לפני הפעלת writes אחרי restore. אם גם witness אבד או תקינותו אינה ידועה, writes נשארים כבויים עד שחזור סמכותי ובירור; יצירת witness ריק עם אותו מזהה אסורה. ההגנה אינה יכולה לשחזר מידע שנמחק משני מקורות האמת יחד. התחלת deployment חדש אינה הרשאה למחזר operationIds היסטוריים.
+
+בדיקות restore סינתטיות משחזרות primary ללא receipt או עם snapshot של prepared לאחר אפקט ספק, ואז מנסות שוב עם אישור חדש: מתקבל quarantine ואפס קריאות ספק נוספות. נבדקים גם witness outage, אובדן commit acknowledgement, מזהה witness שגוי, מסד משותף ו־startup ללא קובץ witness. בדיקת PostgreSQL נוספת יוצרת מסד witness סינתטי נפרד, בודקת commit ופתיחה מחדש ומסירה אותו בסיום. G4 ומוכנות פריסה עדיין אינם מוכחים בשלב זה.

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import pytest
+from witness_helpers import witness_for
 
 from test_receipts import stores  # same real SQLite/PostgreSQL contract fixture
 from universal_connection_service.approvals import ApprovalRecord, approval_ref_hash
@@ -51,7 +52,7 @@ def build_service(store, req, connector=None, cipher=None, target=None, policy=N
     connector = connector or WriteConnector()
     registry = ConnectorRegistry()
     registry.register(Registration(connector=connector, status="trusted", organization_id=req.actor.organization_id))
-    executor = DurableExecutor(store, cipher or ResultCipher({"test": b"x" * 32}, "test"), (target or make_target(req),))
+    executor = DurableExecutor(store, cipher or ResultCipher({"test": b"x" * 32}, "test"), (target or make_target(req),), witness=witness_for(store))
     return ConnectionService(registry, policy_engine=policy, durable_executor=executor), connector
 
 

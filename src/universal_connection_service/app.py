@@ -431,6 +431,8 @@ async def lifespan(app: FastAPI):
             await audit_worker
         if retention_worker is not None:
             await retention_worker
+        if service.durable_executor is not None:
+            service.durable_executor.witness.close()
         close = getattr(state_store, "close", None)
         if close is not None:
             close()

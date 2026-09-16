@@ -202,8 +202,10 @@ def test_persistent_approval_store_hashes_raw_id_and_consumes_atomically():
     store2.close()
 
 
-def test_persistent_approval_verifier_allows_exactly_one_service_execution():
+def test_persistent_approval_verifier_allows_exactly_one_service_execution(tmp_path):
+    from witness_helpers import witness_for
     store = PostgresStateStore(config(auto_migrate=True))
+    store.test_witness_path = tmp_path / "independent-witness.sqlite3"
     suffix = uuid4().hex
     raw_id = f"approval-{suffix}"
     organization_id = f"org-{suffix}"
@@ -233,7 +235,7 @@ def test_persistent_approval_verifier_allows_exactly_one_service_execution():
         approval_verifier=verifier,
         audit_store=store,
         evidence_store=store,
-        durable_executor=DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,)),
+        durable_executor=DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,), witness=witness_for(store)),
     )
     ctx = context(request_id=request_id, organization_id=organization_id, approval_id=raw_id)
 

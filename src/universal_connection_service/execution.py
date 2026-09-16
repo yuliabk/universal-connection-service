@@ -96,8 +96,10 @@ class ResultCipher:
 
 
 class DurableExecutor:
-    def __init__(self, store, cipher: ResultCipher, targets: tuple[ExecutionTarget, ...]):
+    def __init__(self, store, cipher: ResultCipher, targets: tuple[ExecutionTarget, ...], *, witness):
         self.store = store
+        witness.assert_independent(store)
+        self.witness = witness
         self.cipher = cipher
         self.targets = tuple(target.model_copy(deep=True) for target in targets)
         keys = [(t.organization_id, t.service_id, t.capability) for t in self.targets]
@@ -169,6 +171,9 @@ class DurableExecutor:
             contractDigest=receipt.recovery_contract_digest, notAfter=receipt.provider_not_after)
 
     async def _dispatch_result(self, req, ctx, registration, target, receipt, contract):
+        # Independent commit MUST acknowledge before any provider IO. A lost
+        # acknowledgement strands this attempt safely; never retry this write.
+        self.witness.record_dispatch(receipt)
         timeout = ctx.deadline_ms / 1000
         if receipt.provider_not_after is not None:
             timeout = min(timeout, (receipt.provider_not_after - utc_now()).total_seconds())
@@ -278,12 +283,15 @@ class DurableExecutor:
                     raise ReceiptError("EXECUTION_TARGET_DENIED")
                 if receipt.binding_digest != digest:
                     raise ReceiptError("IDEMPOTENCY_CONFLICT")
+                self.witness.check(req.actor.organization_id, req.operation_id, receipt)
                 if receipt.state != "prepared":
                     if replay and allow_dispatch and receipt.state not in {"succeeded", "failed_no_effect"}:
                         return await self._replay(req, ctx, registration, target, receipt)
                     if reconcile and receipt.state not in {"succeeded", "failed_no_effect"}:
                         return await self._reconcile(req, ctx, registration, target, receipt)
                     return self._cached(req, receipt)
+            else:
+                self.witness.check(req.actor.organization_id, req.operation_id, None)
             if not allow_dispatch or reconcile or replay:
                 return self._error(req, "RECEIPT_NOT_DISPATCHED", receipt)
             if (registration.manifest.connector_id, registration.manifest.version) != (target.connector_id, target.connector_version):
@@ -332,14 +340,34 @@ class DurableExecutor:
 def executor_from_env(store) -> DurableExecutor | None:
     target_json = os.getenv("UCS_EXECUTION_TARGETS_JSON")
     keyring_json = os.getenv("UCS_RECEIPT_KEYRING_JSON")
-    if not target_json and not keyring_json:
+    witness_path = os.getenv("UCS_EXECUTION_WITNESS_PATH")
+    witness_url = os.getenv("UCS_EXECUTION_WITNESS_POSTGRES_URL")
+    witness_id = os.getenv("UCS_EXECUTION_WITNESS_ID")
+    if not any((target_json, keyring_json, witness_path, witness_url, witness_id)):
         return None
+    witness_store = None
     try:
         if not target_json or not keyring_json or store is None or not store.receipts_durable:
             raise ValueError("incomplete durable execution configuration")
         config = json.loads(keyring_json)
         keys = {name: base64.b64decode(value, validate=True) for name, value in config["keys"].items()}
+        if not witness_id or bool(witness_path) == bool(witness_url):
+            raise ValueError("independent witness configuration required")
+        from .dispatch_witness import DispatchWitness
+        if witness_url:
+            from .postgres_store import PostgresStateStore, PostgresStoreConfig
+            from pydantic import SecretStr
+            witness_store = PostgresStateStore(PostgresStoreConfig(dsn=SecretStr(witness_url)))
+        else:
+            from pathlib import Path
+            from .persistence import SQLiteStateStore
+            if hasattr(store, "config") or not Path(witness_path).is_file():
+                raise ValueError("PostgreSQL execution requires a separately provisioned PostgreSQL witness")
+            witness_store = SQLiteStateStore(witness_path)
+        witness = DispatchWitness(witness_store, witness_id)
         return DurableExecutor(store, ResultCipher(keys, config["activeKey"]),
-                               tuple(ExecutionTarget.model_validate(t) for t in json.loads(target_json)))
+                               tuple(ExecutionTarget.model_validate(t) for t in json.loads(target_json)), witness=witness)
     except Exception:
+        if witness_store is not None:
+            witness_store.close()
         raise RuntimeError("Durable execution configuration is invalid") from None

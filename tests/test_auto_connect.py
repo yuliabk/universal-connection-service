@@ -1,5 +1,6 @@
 import asyncio
 import pytest
+from witness_helpers import witness_for
 from datetime import datetime, timedelta, timezone
 
 from mcp import Client
@@ -272,7 +273,7 @@ def test_trusted_write_pauses_for_execution_approval_and_consumes_once(tmp_path)
         providerAccountId="account-1", connectorId="trusted-records", connectorVersion="1.0.0",
         operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
         successIsFinal=True, resultRetentionSeconds=3600)
-    service.durable_executor = DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,))
+    service.durable_executor = DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,), witness=witness_for(store))
 
     started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
     assert started.workflow.stage == "awaiting_execution_approval"
@@ -320,7 +321,7 @@ def test_unknown_execution_does_not_offer_workflow_restart(tmp_path):
         providerAccountId="account-1", connectorId="trusted-records", connectorVersion="1.0.0",
         operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
         successIsFinal=True, resultRetentionSeconds=3600)
-    service.durable_executor = DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,))
+    service.durable_executor = DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,), witness=witness_for(store))
     actor = principal("connectors:review", "approvals:issue")
     started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
     issued = orchestrator.issue_execution_approval(actor, started.workflow.workflow_id,
@@ -374,7 +375,7 @@ def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_pa
         operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
         successIsFinal=True, resultRetentionSeconds=3600)
     cipher = ResultCipher({"test": b"x" * 32}, "test")
-    service.durable_executor = DurableExecutor(store, cipher, (target,))
+    service.durable_executor = DurableExecutor(store, cipher, (target,), witness=witness_for(store))
     actor = principal("connectors:review", "approvals:issue")
     started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
     issued = orchestrator.issue_execution_approval(actor, started.workflow.workflow_id,
@@ -390,7 +391,7 @@ def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_pa
     original = store.get_receipt("org-1", req.operation_id)
     store.close()
     reopened, _, service2, _, orchestrator2 = stack(trusted=connector, path=path)
-    service2.durable_executor = DurableExecutor(reopened, cipher, (target,))
+    service2.durable_executor = DurableExecutor(reopened, cipher, (target,), witness=witness_for(reopened))
     resumed = asyncio.run(orchestrator2.advance(actor, started.workflow.workflow_id,
         AutoConnectAdvanceCommand(request=req)))
     assert resumed.workflow.stage == ("awaiting_reconciliation" if uncertain else "completed")

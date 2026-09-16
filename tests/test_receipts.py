@@ -23,6 +23,7 @@ def stores(request, tmp_path):
         from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
         def factory():
             store = PostgresStateStore(PostgresStoreConfig(dsn=SecretStr(dsn), sslmode="disable", autoMigrate=True))
+            store.test_witness_path = tmp_path / "independent-witness.sqlite3"
             opened.append(store)
             return store
     else:
