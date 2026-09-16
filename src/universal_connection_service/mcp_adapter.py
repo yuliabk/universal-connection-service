@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -14,6 +15,11 @@ from .contracts import (
     ConnectorResult,
     ExecutionContext,
     Model,
+)
+from .credentials import (
+    CredentialResolutionError,
+    CredentialResolver,
+    CredentialTarget,
 )
 
 try:
@@ -62,23 +68,20 @@ class MCPConnectorConfig(Model):
 
 
 class MCPConnectorAdapter:
-    """MCP implementation of ConnectorContract.
-
-    The adapter maps UCS capabilities to MCP tool names and deliberately keeps
-    credentials outside the transport configuration. Authenticated transports
-    are deferred to a CredentialResolver-backed client factory.
-    """
+    """MCP implementation of ConnectorContract with brokered auth support."""
 
     def __init__(
         self,
         config: MCPConnectorConfig,
         *,
         client_factory: Callable[[], Any] | None = None,
+        credential_resolver: CredentialResolver | None = None,
     ) -> None:
         if config.endpoint is None and client_factory is None:
             raise ValueError("MCP connector requires an endpoint or an injected client factory")
         self.config = config
         self._client_factory = client_factory
+        self._credential_resolver = credential_resolver
         self._bindings = {binding.capability: binding.tool for binding in config.bindings}
 
     def manifest(self) -> ConnectorManifest:
@@ -92,13 +95,43 @@ class MCPConnectorAdapter:
             auth=self.config.auth,
         )
 
-    def _client(self):
+    @asynccontextmanager
+    async def _client(self, ctx: ExecutionContext):
         if self._client_factory is not None:
-            return self._client_factory()
+            async with self._client_factory() as client:
+                yield client
+            return
+
         if Client is None:
             raise RuntimeError("MCP SDK is not installed; install universal-connection-service[mcp]")
         assert self.config.endpoint is not None
-        return Client(self.config.endpoint.url)
+
+        if self.config.auth.type == "none":
+            async with Client(self.config.endpoint.url) as client:
+                yield client
+            return
+
+        if self._credential_resolver is None:
+            raise CredentialResolutionError(
+                "CREDENTIAL_RESOLUTION_UNAVAILABLE",
+                "Authenticated MCP transport requires a credential resolver",
+                user_action_required=True,
+            )
+        if ctx.credential_handle is None:
+            raise CredentialResolutionError(
+                "CREDENTIAL_HANDLE_REQUIRED",
+                "Authenticated connection requires a credential handle",
+                user_action_required=True,
+            )
+
+        target = CredentialTarget(
+            transport="mcp",
+            serviceId=self.config.service_id,
+            url=self.config.endpoint.url,
+            auth=self.config.auth,
+        )
+        async with self._credential_resolver.mcp_client(target, ctx) as client:
+            yield client
 
     async def _tool_names(self, client: Any) -> set[str]:
         names: set[str] = set()
@@ -113,7 +146,7 @@ class MCPConnectorAdapter:
     async def health_check(self, ctx: ExecutionContext) -> bool:
         try:
             async with asyncio.timeout(ctx.deadline_ms / 1000):
-                async with self._client() as client:
+                async with self._client(ctx) as client:
                     available = await self._tool_names(client)
             return set(self._bindings.values()).issubset(available)
         except Exception:
@@ -135,19 +168,9 @@ class MCPConnectorAdapter:
                 ),
             )
 
-        if self.config.auth.type != "none" and self._client_factory is None:
-            return ConnectorResult(
-                status="failed",
-                error=ConnectionError(
-                    code="CREDENTIAL_RESOLUTION_UNAVAILABLE",
-                    message="Authenticated MCP transport requires a credential resolver",
-                    userActionRequired=True,
-                ),
-            )
-
         try:
             async with asyncio.timeout(ctx.deadline_ms / 1000):
-                async with self._client() as client:
+                async with self._client(ctx) as client:
                     result = await client.call_tool(tool, input)
 
             if result.is_error:
@@ -168,6 +191,15 @@ class MCPConnectorAdapter:
                     ]
                 }
             return ConnectorResult(status="success", data=data)
+        except CredentialResolutionError as exc:
+            return ConnectorResult(
+                status="failed",
+                error=ConnectionError(
+                    code=exc.code,
+                    message=exc.safe_message,
+                    userActionRequired=exc.user_action_required,
+                ),
+            )
         except TimeoutError:
             return ConnectorResult(
                 status="failed",
