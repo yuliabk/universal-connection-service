@@ -30,3 +30,13 @@
 בדיקות `test_metadata_crypto.py` בודקות tenant/AAD, tampering, framing של אינדקסים, תצורה פגומה ו־rotation. `test_metadata_storage.py` בודקות restart, CAS בין מופעים, rollback של שני מסמכים, pagination, מפתחות שגויים וקריאה ישירה במסד. ה־bodies בבדיקת rollback מייצגים approval ו־receipt; אין זו עדיין בדיקת coordinator אמיתי עם האחסון המוצפן.
 
 העלות הצפויה היא הצפנה/פענוח לכל גישה, directory מוצפן וכתיבות נוספות עבור lookup aliases. סריקות תפעוליות יעברו באצוות לפי tenant; אין להעמיס את כל המסד לזיכרון כדי לשמר את ממשק SQL הישן. מפתח האינדקס הוא סוד ארוך־חיים; אובדנו מחייב שחזור מפתח או migration מאומת ואינו הרשאה לפתוח keyspace חדש.
+
+## חיבור ממשקי הבקרה
+
+`EncryptedControlStore` מחבר כעת את ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore ו־WorkflowStore למסמכים מוצפנים, בלי ירושה או delegation לכתיבה בטבלאות הגלויות. ה־runtime אינו מפעיל אותו עדיין: תחילה יש להשלים ReceiptStore ו־witness תחת אותם גבולות טרנזקציה.
+
+האישורים נשמרים תחת tenant ומפתחים opaque. ממשק get_approval הקיים מקבל hash בלי organization; עבורו נשמר locator מוצפן במרחב host פנימי, שמצביע על tenant ונגיש רק לקוד האחסון. אין endpoint למציאת ארגון לפי locator. אותם locators שומרים על ייחודיות גלובלית קיימת של audit/evidence/workflow IDs. locator, המסמך וה־request alias של workflow נוצרים באותה טרנזקציה.
+
+צריכת אישור, revocation, claim ועדכון workflow קוראים ונועלים את המסמך בתוך טרנזקציה ומעדכנים ב־CAS. lease נשמר בתוך ciphertext גם כשהוא מוחרג מסריאליזציית ה־API. revision של המסמך הוא מנגנון אחסון נפרד מ־revision העסקי של workflow; claim/release אינם משנים את האחרון. עדכון workflow רשאי לשנות רק את השדות שהמימוש הקודם עדכן ואינו משנה request identity או fingerprint.
+
+רשימות לפי request/kind מסננות לאחר פענוח באצוות בתוך tenant. הדבר משמר את החוזה הקיים אך מגדיל את עלות הקריאה לעומת אינדקס SQL ייעודי; אין טענת שיפור ביצועים. ה־ports הקיימים מחזירים list ולכן התוצאה עצמה עדיין יכולה להיות גדולה. לפני הרחבת שימוש production נדרשת מדידת עומס ותקצוב מתאים.

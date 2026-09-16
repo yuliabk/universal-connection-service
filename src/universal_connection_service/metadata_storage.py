@@ -119,9 +119,15 @@ class MetadataRepository:
             (self.profile_id, row["record_index"], str(row["revision"])), row["envelope"])
         return MetadataDocument(row["record_index"], row["revision"], body)
 
-    def get(self, conn, domain: str, organization_id: str, identity: tuple[str, ...]) -> MetadataDocument | None:
+    def get(self, conn, domain: str, organization_id: str, identity: tuple[str, ...], *, lock: bool = False) -> MetadataDocument | None:
         tenant_index = self._tenant_index(organization_id)
         record_index = self._record_index(domain, organization_id, identity)
+        if lock:
+            # Portable row lock: PostgreSQL serializes contenders until commit;
+            # SQLite already holds BEGIN IMMEDIATE. Do not advance the revision.
+            self.store._receipt_query(conn, """UPDATE metadata_document SET revision = revision
+                WHERE domain = ? AND tenant_index = ? AND record_index = ?""",
+                (domain, tenant_index, record_index))
         row = self.store._receipt_query(conn, """SELECT record_index, revision, envelope FROM metadata_document
             WHERE domain = ? AND tenant_index = ? AND record_index = ?""",
             (domain, tenant_index, record_index)).fetchone()
