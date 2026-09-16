@@ -102,3 +102,11 @@ Commit `e69d5db991681e49570151d068790bca053cef69` עבר [CI עם PostgreSQL 16 
 לפני בקשת אישור ביצוע, auto-connect בודק דרך ConnectionService אם יש תוצאת dispatch קודמת. הדגל הפנימי `allow_dispatch=False` מחייב בדיקות context, policy, tenant, actor וחשבון ספק רגילות; הוא אינו מכין receipt, צורך אישור או מפעיל connector. receipt חסרה או prepared מחזירה RECEIPT_NOT_DISPATCHED וממשיכה למסלול האישורים הרגיל. תוצאה סופית משחזרת completed, ותוצאה עמומה מחזירה awaiting_reconciliation. advance של workflow במצב זה יכול לרענן תוצאה שכבר נשמרה; הוא עדיין אינו מבצע בירור מול הספק.
 
 בדיקת fault injection נכשלת בשמירת workflow לאחר ביצוע ספק ושמירת receipt, פותחת מחדש את SQLite ומחדשת ללא approval ID. גם הצלחה וגם unknown נשמרות עם אותו receipt ומונה connector נשאר 1. בדיקת service נוספת מוכיחה שגם אישור תקף אינו מאפשר dispatch בנתיב status בלבד. מקומית: 33 בדיקות auto-connect/durable execution עברו ו־22 בדיקות PostgreSQL דולגו.
+
+### G3 — מחיקת תוצאות שפג תוקפן
+
+worker של retention סורק עד 10 תוצאות סופיות בכל סבב, עם cursor לפי receiptId והשהיה של 5 שניות. הוא מאמת את ה־AAD ואת expiresAt מתוך מעטפת AES-GCM, ולכן תומך גם בתוצאות G2 הקיימות ללא migration. מפתח חסר או מעטפה פגומה משאירים את התוצאה ומדווחים הודעה כללית; הם אינם אישור למחיקה. נדרשת זמינות מפתחות rotation הישנים עד השלמת retention.
+
+מחיקת ciphertext המדויק וסימון resultPurgedAt ב־receipt נעשים באותה טרנזקציה עם CAS. receipt סופית, operationId, binding ו־outbox נשמרים. ניסיון חוזר מחזיר RESULT_EXPIRED עם executionState=succeeded, ללא הפעלת המחבר. אין מחיקת receipt או שחרור מפתח. expiry חוסם קריאה מיד; ניקוי האחסון מתבצע בהדרגה וזמנו תלוי במספר התוצאות ובזמינות worker/keyring. זהו DELETE ממסד הנתונים הפעיל, לא הבטחת מחיקה מעותקי גיבוי, WAL או שטחי דיסק פנויים; לפריסה נדרשת מדיניות retention נפרדת עבורם.
+
+בדיקות משותפות ל־SQLite/PostgreSQL מכסות מחיקה אחרי expiry, פתיחה מחדש ללא ביצוע חוזר, שמירת audit, מפתח חסר, תוצאה שלא פג תוקפה, tenant scope, ciphertext mismatch, rollback של מחיקה ב־CAS conflict ושני workers שמוחקים פעם אחת. מקומית עברו 27 בדיקות retention/durable execution ו־25 בדיקות PostgreSQL דולגו. G3 עדיין פתוח: recovery מאומת מול ספק ו־restore quarantine.

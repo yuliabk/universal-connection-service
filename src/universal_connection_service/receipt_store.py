@@ -217,6 +217,34 @@ class SQLReceiptStore:
                 """, (organization_id, limit)).fetchall()
             return [ReceiptAudit.model_validate_json(row["event_json"]) for row in rows]
 
+    def receipt_result_page(self, after: str = "", limit: int = 10) -> list[tuple[ExecutionReceipt, str]]:
+        """Host-only bounded scan, including legacy G2 encrypted envelopes."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._receipt_transaction() as conn:
+            rows = self._receipt_query(conn, """SELECT r.receipt_json, p.ciphertext
+                FROM execution_receipt r JOIN execution_result p
+                ON r.organization_id = p.organization_id AND r.operation_id = p.operation_id
+                WHERE r.receipt_id > ? AND r.state IN ('succeeded', 'failed_no_effect')
+                ORDER BY r.receipt_id LIMIT ?""", (after, limit)).fetchall()
+            return [(ExecutionReceipt.model_validate_json(row["receipt_json"]), row["ciphertext"]) for row in rows]
+
+    def purge_receipt_result(self, organization_id: str, operation_id: str, expected_version: int, ciphertext: str) -> bool:
+        """Trusted retention worker calls only after authenticating envelope expiry.
+
+        Delete the exact observed payload; preserve the operation tombstone forever.
+        """
+        with self._receipt_transaction() as conn:
+            deleted = self._receipt_query(conn, """DELETE FROM execution_result
+                WHERE organization_id = ? AND operation_id = ? AND ciphertext = ?""",
+                (organization_id, operation_id, ciphertext)).rowcount
+            if not deleted:
+                return False
+            receipt = self._expected(conn, organization_id, operation_id, expected_version, {"succeeded", "failed_no_effect"})
+            receipt.result_purged_at = utc_now()
+            self._save(conn, receipt, expected_version)
+            return True
+
     def acknowledge_receipt_audit(self, organization_id: str, event_id: str) -> bool:
         with self._receipt_transaction() as conn:
             cursor = self._receipt_query(conn, """

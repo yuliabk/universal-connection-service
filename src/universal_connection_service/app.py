@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from .approvals import ApprovalStore, PersistentApprovalVerifier
 from .receipt_audit import run_receipt_audit_worker
+from .receipt_retention import run_receipt_retention_worker
 from .auto_connect import build_auto_connect_router
 from .build_auto_connect import BuildAwareAutoConnectOrchestrator, VerifiedBuildCoordinator
 from .build_pipeline import (
@@ -417,6 +418,9 @@ async def lifespan(app: FastAPI):
     audit_stop = asyncio.Event()
     audit_worker = (asyncio.create_task(run_receipt_audit_worker(state_store, audit_stop))
                     if state_store is not None and state_store.receipts_durable else None)
+    retention_worker = (asyncio.create_task(run_receipt_retention_worker(
+        state_store, service.durable_executor.cipher, audit_stop))
+        if service.durable_executor is not None else None)
     try:
         yield
     finally:
@@ -424,6 +428,8 @@ async def lifespan(app: FastAPI):
         if audit_worker is not None:
             # Finish any in-flight database transaction before closing its pool.
             await audit_worker
+        if retention_worker is not None:
+            await retention_worker
         close = getattr(state_store, "close", None)
         if close is not None:
             close()

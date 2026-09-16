@@ -63,17 +63,32 @@ class ResultCipher:
         ciphertext = self._cipher(self.active_key, receipt.organization_id).encrypt(nonce, body, self._aad(receipt))
         return json.dumps({"keyId": self.active_key, "sealed": base64.b64encode(nonce + ciphertext).decode()})
 
-    def open(self, receipt, envelope: str) -> ConnectorResult:
-        from datetime import datetime
+    def _decode(self, receipt, envelope: str):
         try:
             packet = json.loads(envelope)
             sealed = base64.b64decode(packet["sealed"], validate=True)
             body = json.loads(self._cipher(packet["keyId"], receipt.organization_id).decrypt(sealed[:12], sealed[12:], self._aad(receipt)))
-            if datetime.fromisoformat(body["expiresAt"]) <= utc_now():
-                raise ReceiptError("RESULT_EXPIRED")
-            return ConnectorResult.model_validate(body["result"])
+            return body
         except ReceiptError:
             raise
+        except Exception:
+            raise ReceiptError("RESULT_UNAVAILABLE") from None
+
+    def expires_at(self, receipt, envelope: str):
+        from datetime import datetime, timezone
+        try:
+            expires = datetime.fromisoformat(self._decode(receipt, envelope)["expiresAt"])
+            if expires.tzinfo is None:
+                raise ValueError("expiry requires timezone")
+            return expires.astimezone(timezone.utc)
+        except Exception:
+            raise ReceiptError("RESULT_UNAVAILABLE") from None
+
+    def open(self, receipt, envelope: str) -> ConnectorResult:
+        if self.expires_at(receipt, envelope) <= utc_now():
+            raise ReceiptError("RESULT_EXPIRED")
+        try:
+            return ConnectorResult.model_validate(self._decode(receipt, envelope)["result"])
         except Exception:
             raise ReceiptError("RESULT_UNAVAILABLE") from None
 
@@ -122,7 +137,8 @@ class DurableExecutor:
         try:
             ciphertext = self.store.get_receipt_result(receipt.organization_id, receipt.operation_id)
             if ciphertext is None:
-                raise ReceiptError("RESULT_UNAVAILABLE")
+                current = self.store.get_receipt(receipt.organization_id, receipt.operation_id)
+                raise ReceiptError("RESULT_EXPIRED" if current and current.result_purged_at else "RESULT_UNAVAILABLE")
             result = self.cipher.open(receipt, ciphertext)
             return ConnectionResult(requestId=req.request_id, status=result.status, serviceId=receipt.service_id,
                 capability=receipt.capability, connectorId=receipt.connector_id, data=result.data, error=result.error,
