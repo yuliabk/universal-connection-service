@@ -224,6 +224,56 @@ class SQLReceiptStore:
                 """, (organization_id, event_id))
             return cursor.rowcount == 1
 
+    def receipt_audit_organizations(self, limit: int = 100, *, after: str = "") -> list[str]:
+        """Host worker discovery only; never exposed as a tenant API."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._receipt_transaction() as conn:
+            rows = self._receipt_query(conn, """SELECT DISTINCT organization_id
+                FROM execution_outbox WHERE delivered = 0 AND organization_id > ?
+                ORDER BY organization_id LIMIT ?""", (after, limit)).fetchall()
+            return [row["organization_id"] for row in rows]
+
+    def deliver_receipt_audit(self, organization_id: str, limit: int = 100) -> int:
+        """Atomically project the outbox into the colocated audit store and ack.
+
+        A commit acknowledgement can be lost safely: replay uses the same audit ID.
+        No connector or receipt state transition participates in delivery.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._receipt_transaction() as conn:
+            rows = self._receipt_query(conn, """SELECT event_json FROM execution_outbox
+                WHERE organization_id = ? AND delivered = 0 ORDER BY event_id LIMIT ?""",
+                (organization_id, limit)).fetchall()
+            for row in rows:
+                event = ReceiptAudit.model_validate_json(row["event_json"])
+                receipt = self._load_receipt(conn, organization_id, event.operation_id)
+                if (event.organization_id != organization_id or receipt is None
+                    or receipt.audit_id != event.event_id or receipt.receipt_id != event.receipt_id
+                    or receipt.state != event.state):
+                    raise ReceiptError("AUDIT_OUTBOX_CONFLICT")
+                values = dict(audit_id=event.event_id, request_id=event.request_id,
+                    organization_id=organization_id, user_id=event.user_id, agent_id=event.agent_id,
+                    service_id=event.service_id, capability=event.capability, operation=event.operation,
+                    status="success" if event.state == "succeeded" else "failed",
+                    connector_id=event.connector_id, policy_decision=None,
+                    error_code=None if event.state == "succeeded" else "EXECUTION_FAILED_NO_EFFECT",
+                    approval_ref_hash=receipt.approval_ref_hash,
+                    created_at=self._receipt_time(event.created_at))
+                self._receipt_query(conn, """INSERT INTO audit_event
+                    (audit_id, request_id, organization_id, user_id, agent_id, service_id,
+                     capability, operation, status, connector_id, policy_decision, error_code,
+                     approval_ref_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (audit_id) DO NOTHING""", tuple(values.values()))
+                existing = self._receipt_query(conn, "SELECT * FROM audit_event WHERE audit_id = ?",
+                    (event.event_id,)).fetchone()
+                if existing is None or any(existing[key] != value for key, value in values.items()):
+                    raise ReceiptError("AUDIT_EVENT_CONFLICT")
+                self._receipt_query(conn, """UPDATE execution_outbox SET delivered = 1
+                    WHERE organization_id = ? AND event_id = ?""", (organization_id, event.event_id))
+            return len(rows)
+
 
 def receipt_result_schema(prefix: str = "") -> str:
     return f"""CREATE TABLE IF NOT EXISTS {prefix}execution_result (

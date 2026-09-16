@@ -88,3 +88,11 @@ Commit `e69d5db991681e49570151d068790bca053cef69` עבר [CI עם PostgreSQL 16 
 4. חידוש auto-connect דרך receipt קיימת אחרי crash לפני שמירת workflow, ללא בקשת אישור חדשה לצורך קריאת תוצאה קיימת. status/reconciliation יישארו tenant/actor scoped.
 5. מחיקת payload תוך שמירת tombstone, quarantine ל־restore שאיבד receipts, תקציב reconciliation, וראיות בין תהליכים גם למסלול התאוששות מלא.
 6. ביקורת G4 תסגור גם סיווג capabilities מהימן בכל המתאמים, timeout/cancellation, worker ישן שחוזר לפעול אחרי החלפת בעלות, ומטריצת דרישות מלאה. אין לסמן הפרויקט או UCS-19 כהושלמו לפני כן.
+
+### G3 — מסירת audit
+
+נוסף worker של המארח שמוסר אירועי outbox ל־audit_event באותו backend. הוא פועל גם לאחר restart וללא בקשת retry של המשתמש. בכל טרנזקציה נמסרים עד 100 אירועים של organization אחת, עם eventId מקורי ו־ack באותה טרנזקציה. התנגשות ID עם תוכן אחר חוסמת ack. סבב מוגבל ל־100 ארגונים עם cursor, כדי שארגון עם תקלה לא יחסום את הארגונים שאחריו. בין סבבים יש השהיה של 5 שניות; shutdown ממתין לסיום הטרנזקציה לפני סגירת האחסון. שגיאות delivery נרשמות ללא פרטי payload או מזהי ארגון.
+
+ה־audit הקיים מקבל את שדות הפעולה וה־approval hash בלבד; פרטי receipt, operationId, החלטת reconciliation וגרסת connector נשארים ב־outbox המקושר באותו auditId. הצלחת execution אינה ממתינה למסירה. כשל במסירה משאיר את ה־receipt הסופית ואת ה־outbox לשחזור ואינו קורא למחבר. זהו sink מקומי; מסירה למערכת audit חיצונית אינה ממומשת.
+
+בדיקות חדשות מכסות תחרות בין שני חיבורים, restart, הפרדת ארגונים, rollback בכשל ack, אובדן commit acknowledgement, התנגשות audit ID, cursor והתאוששות worker לאחר כשל discovery. מקומית: 6 עברו ו־5 בדיקות PostgreSQL דולגו; הרגרסיה לפני תוספת בדיקות cursor/worker: 148 עברו ו־46 דולגו. G3 נותר פתוח עד השלמת recovery, auto-connect, retention ו־restore.

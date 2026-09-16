@@ -254,7 +254,7 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
         return True
 
     def _receipt_sql(self, sql: str) -> str:
-        for table in ("execution_receipt", "execution_attempt", "execution_outbox", "execution_result", "approval_grant"):
+        for table in ("execution_receipt", "execution_attempt", "execution_outbox", "execution_result", "approval_grant", "audit_event"):
             sql = sql.replace(table, "ucs_internal." + table)
         return sql.replace("?", "%s")
 
