@@ -66,6 +66,10 @@ class ConnectorRegistry:
         self._items[key] = item
         item.persist()
 
+    def exact(self, organization_id: str, connector_id: str, version: str) -> Registration | None:
+        """Return one exact runtime registration without tenant/global fallback."""
+        return self._items.get((organization_id, connector_id, version))
+
     def trusted(
         self,
         service_id: str,
