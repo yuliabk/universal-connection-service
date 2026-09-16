@@ -71,6 +71,13 @@ def stack(open_world=False):
     return store, runner, compiler, orchestrator
 
 
+def approve_and_activate(actor, orchestrator, req):
+    started=asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
+    issued=orchestrator.issue_sandbox_policy_approval(actor,started.workflow.workflow_id,"org-1",expires_in_seconds=300)
+    completed=asyncio.run(orchestrator.activate_sandbox_policy_and_advance(actor,started.workflow.workflow_id,AutoConnectSandboxPolicyActivateCommand(request=req,sandboxPolicyApprovalId=issued.approval.approval_id)))
+    return started, issued, completed
+
+
 def test_policy_approval_activation_execution_and_reuse():
     store, runner, _, orchestrator=stack(False); actor=principal("connectors:review","approvals:issue","connectors:promote"); req=request()
     started=asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
@@ -101,4 +108,18 @@ def test_unresolved_policy_fails_closed_then_recompiles_after_operator_rule():
     advanced=asyncio.run(orchestrator.advance(actor,started.workflow.workflow_id,AutoConnectAdvanceCommand(request=req)))
     assert advanced.workflow.last_code=="SANDBOX_POLICY_APPROVAL_REQUIRED"
     assert orchestrator.policy_status(actor,"org-1",started.workflow.workflow_id).proposal.profile.egress_hosts==("api.records.example",)
+    store.close()
+
+
+def test_policy_profile_hash_drift_requires_fresh_approval():
+    store, runner, compiler, orchestrator=stack(False); actor=principal("connectors:review","approvals:issue","connectors:promote")
+    _,_,first=approve_and_activate(actor,orchestrator,request("req-policy-a"))
+    assert first.workflow.stage=="completed" and runner.calls==1
+    compiler.policy_catalog=SandboxPolicyCatalog((SandboxPolicyRule(organizationId="org-1",serviceId="records",capability="records.read",toolName="records_read",profile=SandboxCapabilityProfile(egressHosts=("api.records.example",),brokeredCredentials=True),reason="Approved upstream changed"),))
+    second=asyncio.run(orchestrator.start(actor,AutoConnectStartCommand(request=request("req-policy-b"))))
+    assert second.workflow.stage=="planning"
+    assert second.workflow.last_code=="SANDBOX_POLICY_APPROVAL_REQUIRED"
+    assert runner.calls==1
+    proposal=orchestrator.policy_status(actor,"org-1",second.workflow.workflow_id).proposal
+    assert proposal.profile.egress_hosts==("api.records.example",)
     store.close()
