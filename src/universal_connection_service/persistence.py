@@ -110,12 +110,7 @@ class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, Protocol):
 
 
 class SQLiteStateStore:
-    """SQLite reference store for UCS control-plane state.
-
-    The store persists metadata and evidence only. Runtime connector Python
-    objects remain process-local and must be rehydrated by a future package or
-    deployment loader after restart.
-    """
+    """SQLite reference store for UCS control-plane state."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
@@ -187,6 +182,23 @@ class SQLiteStateStore:
                 ON audit_event (organization_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_audit_org_request
                 ON audit_event (organization_id, request_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS approval_grant (
+                approval_ref_hash TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                service_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_approval_org_request
+                ON approval_grant (organization_id, request_id, expires_at);
             """
         )
         self._connection.commit()
@@ -385,3 +397,68 @@ class SQLiteStateStore:
             )
             for row in rows
         ]
+
+    def put_approval(self, record) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO approval_grant (
+                    approval_ref_hash, request_id, organization_id, user_id,
+                    agent_id, service_id, capability, operation, expires_at,
+                    consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (approval_ref_hash) DO NOTHING
+                """,
+                (
+                    record.approval_ref_hash,
+                    record.request_id,
+                    record.organization_id,
+                    record.user_id,
+                    record.agent_id,
+                    record.service_id,
+                    record.capability,
+                    record.operation,
+                    record.expires_at.isoformat(),
+                    record.consumed_at.isoformat() if record.consumed_at else None,
+                    record.created_at.isoformat(),
+                ),
+            )
+
+    def get_approval(self, approval_ref_hash: str):
+        from .approvals import ApprovalRecord
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM approval_grant WHERE approval_ref_hash = ?",
+                (approval_ref_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ApprovalRecord(
+            approvalRefHash=row["approval_ref_hash"],
+            requestId=row["request_id"],
+            organizationId=row["organization_id"],
+            userId=row["user_id"],
+            agentId=row["agent_id"],
+            serviceId=row["service_id"],
+            capability=row["capability"],
+            operation=row["operation"],
+            expiresAt=datetime.fromisoformat(row["expires_at"]),
+            consumedAt=datetime.fromisoformat(row["consumed_at"]) if row["consumed_at"] else None,
+            createdAt=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def consume_approval(self, approval_ref_hash: str, consumed_at: datetime) -> bool:
+        timestamp = consumed_at.isoformat()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE approval_grant
+                SET consumed_at = ?
+                WHERE approval_ref_hash = ?
+                  AND consumed_at IS NULL
+                  AND expires_at > ?
+                """,
+                (timestamp, approval_ref_hash, timestamp),
+            )
+            return cursor.rowcount == 1
