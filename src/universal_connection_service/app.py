@@ -29,6 +29,7 @@ from .mcpb_sandbox import DockerMCPBSandboxConfig, SandboxedMCPConnector
 from .openapi_adapter import OpenAPIConnectorAdapter
 from .packages import ConnectorPackageLoader, CosignBundleVerifier, Ed25519PackageVerifier, FilesystemPackageSource
 from .persistence import SQLiteStateStore, WorkflowStore
+from .policy_auto_connect import PolicyAwareAutoConnectOrchestrator, build_policy_auto_connect_router
 from .postgres_store import PostgresStateStore, config_from_env
 from .registry import ConnectorRegistry
 from .rehydration import ConnectorRuntimeRehydrator, RehydrationReport
@@ -36,7 +37,6 @@ from .sandbox_build import (
     FilesystemMCPBArtifactStore,
     GeneratedSandboxMCPPackageBuilder,
     SandboxAwareBuildCoordinator,
-    SandboxBuildAwareAutoConnectOrchestrator,
     SandboxMCPPackageAcquirer,
 )
 from .sandbox_credentials import AgentVaultSandboxBroker
@@ -213,16 +213,8 @@ def _build_sandbox_runner(artifact_store, policy_service, mount_catalog, resolve
         return None, "disabled"
     if artifact_store is None:
         raise RuntimeError("UCS_BUILD_ARTIFACT_DIR is required when MCP package sandboxing is enabled")
-    egress_network = (
-        gateway_manager.config.network_name
-        if gateway_manager is not None
-        else os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK")
-    )
-    egress_proxy_host = (
-        gateway_manager.config.gateway_alias
-        if gateway_manager is not None
-        else os.getenv("UCS_MCP_SANDBOX_EGRESS_PROXY_HOST")
-    )
+    egress_network = gateway_manager.config.network_name if gateway_manager is not None else os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK")
+    egress_proxy_host = gateway_manager.config.gateway_alias if gateway_manager is not None else os.getenv("UCS_MCP_SANDBOX_EGRESS_PROXY_HOST")
     config = DockerMCPBSandboxConfig(
         dockerExecutable=os.getenv("UCS_MCP_SANDBOX_DOCKER", "docker"),
         pythonImage=os.getenv("UCS_MCP_SANDBOX_PYTHON_IMAGE", "python:3.12-slim"),
@@ -352,6 +344,7 @@ else:
     sandbox_build_coordinator = None
 
 auto_connect_orchestrator = None
+policy_auto_connect_orchestrator = None
 if workflow_store is not None:
     common = dict(
         workflow_store=workflow_store,
@@ -362,10 +355,13 @@ if workflow_store is not None:
         evidence_store=state_store,
     )
     if sandbox_build_coordinator is not None:
-        auto_connect_orchestrator = SandboxBuildAwareAutoConnectOrchestrator(
+        policy_auto_connect_orchestrator = PolicyAwareAutoConnectOrchestrator(
             build_coordinator=sandbox_build_coordinator,
+            policy_compiler=sandbox_policy_compiler,
+            sandbox_policy_service=sandbox_policy_service,
             **common,
         )
+        auto_connect_orchestrator = policy_auto_connect_orchestrator
     else:
         auto_connect_orchestrator = BuildAwareAutoConnectOrchestrator(
             build_coordinator=build_coordinator,
@@ -373,8 +369,8 @@ if workflow_store is not None:
         )
 
 auto_connect_kind = (
-    "persistent+build+mcpb-sandbox"
-    if auto_connect_orchestrator is not None and mcp_sandbox_runner is not None
+    "persistent+build+mcpb-sandbox+policy-workflow"
+    if policy_auto_connect_orchestrator is not None
     else "persistent+build"
     if auto_connect_orchestrator is not None
     else "disabled"
@@ -388,6 +384,7 @@ build_kind = (
 )
 sandbox_policy_kind = "per-tool-approved-profiles" if mcp_sandbox_runner is not None else "disabled"
 sandbox_policy_compiler_kind = "deterministic" if mcp_sandbox_runner is not None else "metadata-only"
+sandbox_policy_workflow_kind = "integrated" if policy_auto_connect_orchestrator is not None else "disabled"
 package_rehydration = RehydrationReport()
 
 
@@ -411,7 +408,6 @@ async def lifespan(app: FastAPI):
             sandbox_gateway_manager.ensure()
             sandbox_gateway_state = "ready"
         except SandboxGatewayError:
-            # Zero-capability sandboxing remains available; privileged egress fails closed and retries ensure lazily.
             sandbox_gateway_state = "unavailable"
     package_rehydration = _rehydrate_packages()
     yield
@@ -423,6 +419,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Universal Connection Service", version="0.1.0", lifespan=lifespan)
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
 app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
+app.include_router(build_policy_auto_connect_router(policy_auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_sandbox_tool_policy_router(sandbox_policy_service, control_plane_authenticator))
 app.include_router(build_sandbox_policy_compiler_router(sandbox_policy_compiler, control_plane_authenticator))
 
@@ -442,6 +439,7 @@ def health():
         "packageSandbox": mcp_sandbox_kind,
         "sandboxPolicy": sandbox_policy_kind,
         "sandboxPolicyCompiler": sandbox_policy_compiler_kind,
+        "sandboxPolicyWorkflow": sandbox_policy_workflow_kind,
         "sandboxGateway": sandbox_gateway_state,
         "packages": {
             "loaded": package_rehydration.loaded,
