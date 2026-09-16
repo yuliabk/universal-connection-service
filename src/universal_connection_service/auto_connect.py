@@ -39,6 +39,7 @@ NextAction = Literal[
     "provide_execution_approval",
     "retry_validation",
     "reconcile_execution",
+    "review_capability_effect",
     "restart",
     "none",
 ]
@@ -164,6 +165,7 @@ class AutoConnectOrchestrator:
             "awaiting_execution_approval": "issue_execution_approval",
             "ready_to_execute": "advance",
             "awaiting_reconciliation": "reconcile_execution",
+            "awaiting_effect_classification": "review_capability_effect",
             "completed": "none",
             "failed": "restart",
         }[record.stage]
@@ -391,6 +393,13 @@ class AutoConnectOrchestrator:
         request = command.request
         if command.execute_when_ready and not principal.allows_execution(request.actor):
             raise AutoConnectError("EXECUTION_ACTOR_FORBIDDEN", "Principal cannot execute as this actor", status_code=403)
+        registration = self.registry.trusted(plan.service_id, request.capability, request.actor.organization_id)
+        if (registration is not None
+            and not self.connection_service.requires_durable_execution(request, plan, registration)
+            and self.connection_service.effect_catalog.classify(request, registration) != "read_only"):
+            record.stage = "awaiting_effect_classification"
+            record.last_code = "EFFECT_CLASSIFICATION_REQUIRED"
+            return AutoConnectResponse(workflow=self._view(record), plan=plan)
         if plan.auth_requirement.type != "none" and command.credential_handle is None:
             record.stage = "awaiting_credentials"
             record.last_code = "CREDENTIAL_HANDLE_REQUIRED"
@@ -436,6 +445,9 @@ class AutoConnectOrchestrator:
             record.last_code = result.error.code if result.error else "OUTCOME_UNKNOWN"
         elif result.error is not None and result.error.code.startswith("CREDENTIAL_"):
             record.stage = "awaiting_credentials"
+            record.last_code = result.error.code
+        elif result.error is not None and result.error.code == "EFFECT_CLASSIFICATION_REQUIRED":
+            record.stage = "awaiting_effect_classification"
             record.last_code = result.error.code
         elif result.error is not None and result.error.code.startswith("APPROVAL_"):
             record.stage = "awaiting_execution_approval"
@@ -541,9 +553,11 @@ class AutoConnectOrchestrator:
 
         binding = None
         executor = self.connection_service.durable_executor
-        side_effecting = (request.operation != "read" or not request.read_only or request.risk_hints.destructive
-                          or request.risk_hints.financial or request.risk_hints.permission_increase
-                          or (executor is not None and executor.protects(request)))
+        plan = self.connection_service.compiler.compile(request)
+        registration = self.registry.trusted(plan.service_id, request.capability, organization_id)
+        if registration is None:
+            raise AutoConnectError("CONNECTION_UNAVAILABLE", "Connector is no longer available")
+        side_effecting = self.connection_service.requires_durable_execution(request, plan, registration)
         if side_effecting and executor is not None:
             from .receipts import ReceiptError
             try:

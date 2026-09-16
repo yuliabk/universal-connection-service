@@ -10,6 +10,7 @@ from .persistence import AuditEvent, AuditStore, EvidenceRecord, EvidenceStore
 from .policy import ApprovalVerifier, PolicyEngine
 from .registry import ConnectorRegistry
 from .execution import DurableExecutor
+from .effects import EffectCatalog
 
 
 class ConnectionService:
@@ -23,10 +24,13 @@ class ConnectionService:
         evidence_store: EvidenceStore | None = None,
         discovery_engine: DiscoveryEngine | None = None,
         durable_executor: DurableExecutor | None = None,
+        effect_catalog: EffectCatalog | None = None,
     ):
         self.registry = registry
+        self.effect_catalog = effect_catalog if effect_catalog is not None else EffectCatalog()
         self.compiler = ConnectionCompiler(
             registry,
+            effect_catalog=self.effect_catalog,
             policy_engine=policy_engine,
             evidence_store=evidence_store,
             discovery_engine=discovery_engine,
@@ -145,6 +149,13 @@ class ConnectionService:
             approval_id=approval_id,
         )
 
+    def requires_durable_execution(self, req, plan, registration):
+        return (self.effect_catalog.classify(req, registration) == "side_effecting"
+                or req.operation != "read" or not req.read_only or plan.risk.destructive
+                or plan.risk.financial or plan.risk.permission_increase
+                or req.risk_hints.destructive or req.risk_hints.financial or req.risk_hints.permission_increase
+                or (self.durable_executor is not None and self.durable_executor.protects(req)))
+
     async def execute(self, req: ConnectionRequest, ctx: ExecutionContext, *, allow_dispatch: bool = True, reconcile: bool = False, replay: bool = False) -> ConnectionResult:
         req, ctx = req.model_copy(deep=True), ctx.model_copy(deep=True)
         service_id = self.compiler.service_id(req)
@@ -182,10 +193,12 @@ class ConnectionService:
                 approval_id=ctx.approval_id,
             )
 
-        side_effecting = (req.operation != "read" or not req.read_only or plan.risk.destructive
-                          or plan.risk.financial or plan.risk.permission_increase
-                          or req.risk_hints.destructive or req.risk_hints.financial or req.risk_hints.permission_increase
-                          or (self.durable_executor is not None and self.durable_executor.protects(req)))
+        item = self.registry.trusted(plan.service_id, req.capability, req.actor.organization_id)
+        if item is None or item.manifest.connector_id != plan.connector_id:
+            return self._failed(req, plan.service_id, "CONNECTION_UNAVAILABLE", "Connector is no longer available")
+        selected_identity = (item.manifest.connector_id, item.manifest.version)
+        effect = self.effect_catalog.classify(req, item)
+        side_effecting = self.requires_durable_execution(req, plan, item)
         if side_effecting:
             if self.durable_executor is None:
                 self._persist_approval_evidence(req, connector_id=plan.connector_id, approval_id=ctx.approval_id,
@@ -198,6 +211,11 @@ class ConnectionService:
             if item is None or item.manifest.connector_id != plan.connector_id:
                 return self._failed(req, plan.service_id, "CONNECTION_UNAVAILABLE", "Connector is no longer available")
             return await self.durable_executor.execute(req, ctx, item, allow_dispatch=allow_dispatch, reconcile=reconcile, replay=replay)
+
+        if effect != "read_only":
+            return self._failed(req, plan.service_id, "EFFECT_CLASSIFICATION_REQUIRED",
+                "Host-reviewed capability effects are required before execution", user_action=True,
+                connector_id=plan.connector_id, policy_decision=plan.policy_decision)
 
         if not allow_dispatch or reconcile or replay:
             return self._failed(req, plan.service_id, "RECEIPT_NOT_DISPATCHED", "No durable execution to resume")
@@ -311,8 +329,11 @@ class ConnectionService:
             req.capability,
             req.actor.organization_id,
         )
-        if not item:
-            raise RuntimeError("registry changed during execution")
+        if (not item or (item.manifest.connector_id, item.manifest.version) != selected_identity
+            or self.effect_catalog.classify(req, item) != "read_only"
+            or self.requires_durable_execution(req, plan, item)):
+            return self._failed(req, plan.service_id, "EFFECT_CLASSIFICATION_REQUIRED",
+                "Connector or effect classification changed during authorization", user_action=True)
         result = await item.connector.execute(req.capability, req.input, ctx)
         return self._result(
             req,

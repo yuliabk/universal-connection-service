@@ -35,6 +35,7 @@ WorkflowStage = Literal[
     "awaiting_execution_approval",
     "ready_to_execute",
     "awaiting_reconciliation",
+    "awaiting_effect_classification",
     "completed",
     "failed",
 ]

@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 import pytest
 from witness_helpers import witness_for
@@ -128,6 +129,8 @@ def stack(*, trusted=None, candidates=(), path=":memory:"):
         evidence_store=store,
         discovery_engine=discovery,
     )
+    if trusted is not None and "records.read" in trusted.manifest().capabilities:
+        approve_read(service, request())
     validator = MCPValidationService(
         registry,
         evidence_store=store,
@@ -245,6 +248,7 @@ def test_mcp_candidate_runs_discovery_validation_promotion_and_execution_end_to_
     )
     assert workflow.stage == "awaiting_promotion"
     raw = approval.approval_id
+    approve_read(orchestrator.connection_service, req, connector_id)
 
     completed = asyncio.run(
         orchestrator.promote_and_advance(

@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 from datetime import datetime, timedelta, timezone
 
@@ -79,7 +80,9 @@ def service(*, policy=None, verifier=None):
     registry = ConnectorRegistry()
     connector = StubConnector()
     registry.register(Registration(connector=connector, status="trusted"))
-    return ConnectionService(registry, policy_engine=policy, approval_verifier=verifier), connector
+    svc = ConnectionService(registry, policy_engine=policy, approval_verifier=verifier)
+    approve_read(svc, request())
+    return svc, connector
 
 
 def grant(

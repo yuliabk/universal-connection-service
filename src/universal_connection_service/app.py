@@ -12,6 +12,7 @@ from .approvals import ApprovalStore, PersistentApprovalVerifier
 from .receipt_audit import run_receipt_audit_worker
 from .receipt_retention import run_receipt_retention_worker
 from .execution_api import build_execution_router, build_connection_execution_router
+from .effects import effects_from_env
 from .auto_connect import build_auto_connect_router
 from .build_auto_connect import BuildAwareAutoConnectOrchestrator, VerifiedBuildCoordinator
 from .build_pipeline import (
@@ -287,6 +288,7 @@ sandbox_gateway_manager, sandbox_gateway_kind = _build_gateway_manager()
 sandbox_gateway_state = "pending" if sandbox_gateway_manager is not None else sandbox_gateway_kind
 service = ConnectionService(
     registry,
+    effect_catalog=effects_from_env(),
     approval_verifier=approval_verifier,
     audit_store=state_store,
     evidence_store=state_store,

@@ -56,13 +56,13 @@ ConnectionService יבדוק receipt לפני צריכת אישור שכבר ש�
 
 ## ממשק G2 ומעבר מהגרסה הקודמת
 
-ConnectionService מפנה פעולות שאינן read, readOnly=false, סיכון destructive/financial/permissionIncrease, או capability הרשומה בקטלוג execution targets, ל־DurableExecutor. אין bypass לכתיבה דרך ALLOW של policy או אישור ישן בזיכרון. פעולות read שלא רשומות בקטלוג עדיין נשענות על חוזה הסיווג של הפלטפורמה הקוראת; לפני Production יש להוכיח שכל capability בעלת השפעה מסווגת במטא־נתונים מהימנים גם אם הקורא טוען read. בדיקת G2 מוכיחה חסימת שינוי כזה עבור capability רשומה. כיסוי סיווג מלא למתאמים ופריסה נשאר חלק מביקורת G4.
+ConnectionService מפנה פעולות שאינן read, readOnly=false, סיכון destructive/financial/permissionIncrease, או capability הרשומה בקטלוג execution targets, ל־DurableExecutor. אין bypass לכתיבה דרך ALLOW של policy או אישור ישן בזיכרון. G4 מוסיף קטלוג סיווג מהימן: גם read מחייב סיווג host מפורש לגרסת המחבר ולארגון, כמפורט להלן. הצהרת הקורא לבדה אינה מאפשרת מסלול ללא receipt.
 
 לכתיבה נדרש operationId; requestId יכול להשתנות בין ניסיונות. issuer מחייב אישור עם organization/user/agent/service/capability/operation, operationId ו־bindingDigest. `auto-connect` מנפיק binding דרך ה־executor המהימן. אישור consumed אינו מספיק לביצוע נוסף; receipt קיימת מכריעה אם אפשר להחזיר תוצאה. אישור revoked/expired אינו יכול להתחיל dispatch. אפשר להחליף אישור עבור prepared בלבד אחרי בירור binding; אין החלפת אישור שהופכת unknown לפעולה חדשה.
 
 הגדרות host החדשות (אין ערכים אמיתיים או פריסה בשינוי):
 - `UCS_EXECUTION_TARGETS_JSON`: מערך ExecutionTarget עם organizationId, serviceId, capability, providerAccountId, connectorId, connectorVersion, operations, userIds, agentIds, credentialHandleHashes, allowNoCredentials, successIsFinal ו־resultRetentionSeconds. אין wildcard tenant. hash של handle חייב להיות תואם לחשבון הספק שהמפעיל הגדיר; rotation מוסיפה hash של handle חדש לאותו חשבון. allowNoCredentials תקף רק למחבר auth=none.
-- `UCS_RECEIPT_KEYRING_JSON`: אובייקט עם activeKey ו־keys (מיפוי key ID לחומר מפתח base64 של 32 bytes). החומר נמסר למארח דרך מנגנון סודות; אינו נשמר בקוד, ב־receipts או ב־audit. תצורה חלקית, key באורך שגוי או store לא עמיד גורמים לכשל startup. בלי הגדרות אלה read ממשיך לפי המדיניות, אך write חסום.
+- `UCS_RECEIPT_KEYRING_JSON`: אובייקט עם activeKey ו־keys (מיפוי key ID לחומר מפתח base64 של 32 bytes). החומר נמסר למארח דרך מנגנון סודות; אינו נשמר בקוד, ב־receipts או ב־audit. תצורה חלקית, key באורך שגוי או store לא עמיד גורמים לכשל startup. בלי הגדרות אלה רק read שסווג ואושר בקטלוג effects יכול להמשיך לפי המדיניות; write חסום.
 
 התוצאה נשמרת ב־execution_result כשהיא מוצפנת ב־AES-256-GCM, עם key נגזר לכל organization ו־AAD שקושר receipt/operation/binding. ניתן להשאיר מפתח קודם ב־keyring לקריאת receipts ישנות. אובדן מפתח או expiry מחזירים RESULT_UNAVAILABLE/RESULT_EXPIRED ואינם משחררים operationId לשימוש חוזר. מחיקה פיזית ו־restore quarantine עדיין שייכים ל־G3. אין plaintext body ב־receipt או outbox.
 
@@ -173,3 +173,13 @@ DurableExecutor מחייב כעת DispatchWitness במסד נתונים נפרד
 auto-connect מחייב אותה הרשאת actor לפני dispatch או קריאת receipt קיימת. `connectors:review` ממשיך להספיק לצפייה בתכנון ובסטטוס, אך אינו מסמיך executeWhenReady. הרשאות מפעיל `executions:reconcile` ו־`executions:replay` נשארות הרשאות האצלה נפרדות ומפורשות ברמת הארגון, עם בדיקות target/actor/account ואישור replay המקורי. פורט ConnectionService הפנימי ממשיך להניח שמארח ה־SDK אימת את זהות הקורא; גבולות HTTP המסופקים אוכפים זאת בעצמם.
 
 בדיקות API עם receipt אמיתית מוכיחות חסימת טוקן חסר, טוקן לארגון אחר, scope שגוי, actor חסר והתחזות לכל אחד משדות הזהות; רק הצירוף המאושר מקבל את התוצאה ללא dispatch נוסף. נבדקה גם חסימת עקיפה באמצעות workflow preview/advance עם הרשאת review בלבד. סיווג capability מהימן נותר סעיף נפרד להשלמה.
+
+### G4 — סיווג השפעות מהימן לפני ביצוע
+
+`UCS_CAPABILITY_EFFECTS_JSON` הוא מערך רשומות host עם organizationId, serviceId, connectorId, connectorVersion, capability, effect (`read_only` או `side_effecting`), evidenceSha256 ו־approvalReference. המפתח תואם לכל חמשת ממדי הזהות במדויק; אין wildcard ארגון. סיווג read דורש בדיקת המפעיל ליכולת ולגרסת המחבר, כולל השפעות השירות במעלה השרשרת. SHA256 והפניית האישור מתעדים את הראיה שהמארח אישר; UCS אינו מוכיח בעצמו שתוכן הראיה נכון. יש להגן על תצורה זו כמו על execution targets והרשאות runtime.
+
+ברירת המחדל היא קטלוג ריק. פעולה שמוצגת כ־read ללא סיווג מהימן נחסמת לפני connector IO עם EFFECT_CLASSIFICATION_REQUIRED. אין הסקת read בטוח מ־HTTP GET, משם tool, מ־MCP hints, מ־manifest שנמצא בגילוי או מהצהרת readOnly בבקשה. אותה בדיקה חלה על כל אסטרטגיות המתאמים. סיווג side_effecting מזין readOnly=false למדיניות ומחייב DurableExecutor גם אם policy מותאם מחזיר ALLOW. סיווג read_only אינו מנמיך write/delete, רמז סיכון או capability מוגנת ב־ExecutionTarget.
+
+הקטלוג מוגדר בידי המארח; אין endpoint להוספת סיווג על ידי caller. רשומות מועתקות ונבדקות, כפילות נדחית ותצורה פגומה מכשילה startup ללא הדפסת תוכנה. לאחר await של אימות אישור נבדקים שוב המחבר, גרסתו והסיווג לפני read IO. workflow ללא סיווג ממתין ב־awaiting_effect_classification עם nextAction=review_capability_effect; אחרי טעינת הסיווג המאושר אפשר לבצע advance עם הבקשה המקורית. עדכון גרסה דורש סיווג חדש, גם כשגרסה קודמת סווגה כקריאה.
+
+בדיקות test_effects.py מכסות הצהרת read מזויפת בכל אסטרטגיה, חוסר התאמה בכל רכיב של מפתח הסיווג, מניעת הנמכת write, שינוי אובייקט תצורה לאחר אישור, תצורה פגומה, חסימת מתאם MCP וסנדבוקס, החלפת גרסת מחבר בזמן אימות אישור וחידוש workflow לאחר סקירת המארח. fixtures קיימים מאשרים במפורש את הקריאות הסינתטיות שלהם. הרגרסיה המקומית עברה עם 211 הצלחות ו־79 דילוגים עקב היעדר PostgreSQL/Docker. ביקורת G4 הכוללת וראיות CI לגרסה זו עדיין נדרשות; אין כאן אישור ספק אמיתי או פריסה ל־Production.

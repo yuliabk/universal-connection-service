@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -65,6 +66,7 @@ def stack(open_world=False):
     connector=ToolScopedSandboxedMCPConnector(SandboxedMCPConnectorConfig(connectorId="sandbox-records", serviceId="records", name="Records sandbox", version="1.0.0", bundleDigest="a"*64, bindings=(MCPToolBinding(capability="records.read", tool="records_read"),)), runner=runner)
     registry.register(Registration(connector=connector, status="trusted", organization_id="org-1"))
     service=ConnectionService(registry, approval_verifier=PersistentApprovalVerifier(store), audit_store=store, evidence_store=store)
+    approve_read(service, request())
     control=ControlPlaneService(registry=registry, connection_service=service, state_store=store, evidence_store=store, approval_store=store, mcp_validation_service=NoopValidationService())
     mounts=SandboxMountCatalog(); policy_service=SandboxToolPolicyService(registry=registry, evidence_store=store, approval_store=store, mount_catalog=mounts)
     compiler=LeastPrivilegePolicyCompiler(registry=registry, evidence_store=store, mount_catalog=mounts, policy_catalog=SandboxPolicyCatalog())
