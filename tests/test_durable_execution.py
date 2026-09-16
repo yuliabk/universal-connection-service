@@ -73,7 +73,7 @@ def execute(service, req, approval="synthetic-approval", **ctx_values):
 def test_status_only_never_prepares_or_dispatches_even_with_valid_approval(stores):
     store = stores()
     req = request()
-    raw = approve(store, req)
+    raw = approve(store, req, "status-only-" + uuid4().hex)
     svc, connector = build_service(store, req)
     ctx = ExecutionContext(requestId=req.request_id, organizationId=req.actor.organization_id,
         userId=req.actor.user_id, approvalId=raw)
