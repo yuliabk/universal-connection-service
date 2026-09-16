@@ -5,7 +5,7 @@
 ## לפני הפעלת כתיבה
 
 1. לבחור אחסון עמיד: UCS_STATE_DB_PATH עבור SQLite מקומי או UCS_DATABASE_URL עבור PostgreSQL. מצב זיכרון אינו מתאים ל־receipts עמידים.
-2. ב־PostgreSQL להריץ `ucs-db migrate` עם הרשאת DDL, ואז `ucs-db status`. גרסת הסכימה הנוכחית היא 6. runtime רגיל אינו מריץ מיגרציות; גרסה ישנה נחסמת.
+2. ב־PostgreSQL להריץ `ucs-db migrate` עם הרשאת DDL, ואז `ucs-db status`. גרסת הסכימה הנוכחית היא 7. מיגרציה 7 מכינה אחסון metadata מוצפן אך אינה מפעילה הצפנה ב־runtime הקיים; ראו UCS19_METADATA_ENCRYPTION.md. runtime רגיל אינו מריץ מיגרציות; גרסה ישנה נחסמת.
 3. להכין witness נפרד עבור keyspace חדש בלבד. SQLite: `python -m universal_connection_service.dispatch_witness --sqlite-path <new-path> --witness-id <deployment-id> --confirm-new-keyspace`. PostgreSQL: להחליף `--sqlite-path` ב־`--postgres-env <env-name>` למסד נפרד שכבר קיים. אין לאתחל witness חדש כפתרון ל־restore או quarantine.
 4. לטעון UCS_EXECUTION_WITNESS_ID ונתיב/DSN של witness קיים; לטעון UCS_RECEIPT_KEYRING_JSON ממנגנון סודות ו־UCS_EXECUTION_TARGETS_JSON עם חשבון, actor, capability וגרסת מחבר מאושרים. ראו את החוזים המדויקים ב־DURABLE_EXECUTION.md. אין לשמור מפתחות בקוד או בארגומנט shell גלוי.
 5. להגדיר UCS_CONTROL_PLANE_CREDENTIALS_JSON עם tokenSha256 ו־executionActors מפורשים. להגדיר UCS_CAPABILITY_EFFECTS_JSON לקריאות שעברו בדיקת host. אישור promotion או readOnly בבקשה אינם תחליף לסיווג effects.

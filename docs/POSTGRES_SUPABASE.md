@@ -88,7 +88,8 @@ The current migrations are:
 3. persistent auto-connect workflows;
 4. durable execution receipts, attempts and audit outbox;
 5. operation-bound approvals and encrypted execution results;
-6. tenant-scoped execution operational notices.
+6. tenant-scoped execution operational notices;
+7. encrypted metadata storage primitives (profile, tenant directory, documents); runtime integration is still pending.
 
 Migrations run under a transaction-scoped PostgreSQL advisory lock so two deploy processes cannot apply the same UCS migration concurrently.
 
