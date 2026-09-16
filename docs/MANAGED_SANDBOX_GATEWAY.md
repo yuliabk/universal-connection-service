@@ -42,7 +42,7 @@ The safe profile body remains:
 }
 ```
 
-The capability is a separate field in the approval/apply command. The one-time approval is cryptographically scoped to that exact capability and profile hash.
+The capability is a separate field in the approval/apply command. The one-time approval is scoped to that exact capability and profile hash.
 
 Approval for `records.read` cannot activate `records.delete`, even when both tools belong to the same MCP server and use an identical profile body.
 
@@ -97,7 +97,7 @@ UCS_MCP_SANDBOX_EGRESS_NETWORK=ucs-sandbox-egress
 UCS_MCP_SANDBOX_EGRESS_PROXY_HOST=agent-vault-proxy
 ```
 
-`UCS_MCP_SANDBOX_EGRESS_NETWORK` is now a **network-name prefix** in managed mode.
+`UCS_MCP_SANDBOX_EGRESS_NETWORK` is a network-name prefix in managed mode.
 
 At startup, `ensure()` verifies Docker is reachable and the configured gateway container is running. It does not create a shared execution network.
 
@@ -118,7 +118,7 @@ This prevents two concurrent sandbox executions from sharing a network and remov
 
 ## Docker security boundary
 
-Docker documents `--internal` networks as externally isolated while still permitting communication between members of that specific network. UCS uses that only for the one sandbox-to-gateway hop. citeturn778027search0turn778027search1
+Docker documents `--internal` networks as externally isolated while still permitting communication between members of that specific network. UCS uses that property only for the one sandbox-to-gateway hop. See Docker Engine networking and `docker network create --internal` documentation.
 
 The sandbox still runs with:
 
@@ -144,7 +144,7 @@ Agent Vault/Agent Proxy style credential brokering remains the only supported HT
 - proxy token and CA exist only for the execution;
 - raw handles, proxy tokens and approval IDs are never persisted.
 
-Infisical describes the same credential-brokering model: requests pass through a proxy that attaches credentials at the network boundary rather than exposing them to the agent process. citeturn778027search5
+Infisical describes this credential-brokering pattern as attaching credentials at the network boundary rather than exposing them to the agent process.
 
 ## Runtime and restart
 
