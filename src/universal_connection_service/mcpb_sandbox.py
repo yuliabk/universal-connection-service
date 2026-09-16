@@ -173,6 +173,33 @@ class DockerMCPBSandboxRunner:
         except (OSError, subprocess.TimeoutExpired):
             return False
 
+    def resolve_image(self, image: str) -> str:
+        """Resolve an operator-configured image tag/reference to the immutable local image ID."""
+        try:
+            completed = subprocess.run(
+                [self.config.docker_executable, "image", "inspect", image, "--format", "{{.Id}}"],
+                capture_output=True,
+                text=True,
+                timeout=self.config.startup_timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise MCPBSandboxError(
+                "MCPB_SANDBOX_IMAGE_UNAVAILABLE",
+                "Approved sandbox runtime image is unavailable",
+                retryable=True,
+            ) from None
+        image_id = completed.stdout.strip().lower() if completed.returncode == 0 else ""
+        if not image_id.startswith("sha256:") or len(image_id) != 71 or any(
+            ch not in "0123456789abcdef" for ch in image_id[7:]
+        ):
+            raise MCPBSandboxError(
+                "MCPB_SANDBOX_IMAGE_UNAVAILABLE",
+                "Approved sandbox runtime image is unavailable",
+                retryable=True,
+            )
+        return image_id
+
     def _runtime(self, manifest: MCPBManifest) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
         entry = "/bundle/" + str(_safe_relative_path(manifest.server.entry_point))
         if manifest.server.type == "python":
@@ -189,8 +216,10 @@ class DockerMCPBSandboxRunner:
             "Binary MCPB execution requires an explicit platform/image policy",
         )
 
-    def docker_args(self, bundle_root: Path, manifest: MCPBManifest) -> list[str]:
+    def docker_args(self, bundle_root: Path, manifest: MCPBManifest, *, image_override: str | None = None) -> list[str]:
         image, runtime, runtime_args, runtime_env = self._runtime(manifest)
+        if image_override is not None:
+            image = image_override
         mount = f"type=bind,src={bundle_root},dst=/bundle,readonly"
         args = [
             "run",
@@ -228,9 +257,11 @@ class DockerMCPBSandboxRunner:
         with tempfile.TemporaryDirectory(prefix="ucs-mcpb-") as temporary:
             root = Path(temporary).resolve()
             manifest = _extract_mcpb(data, root)
+            configured_image, _, _, _ = self._runtime(manifest)
+            image_id = self.resolve_image(configured_image)
             params = StdioServerParameters(
                 command=self.config.docker_executable,
-                args=self.docker_args(root, manifest),
+                args=self.docker_args(root, manifest, image_override=image_id),
                 env={},
             )
             try:
