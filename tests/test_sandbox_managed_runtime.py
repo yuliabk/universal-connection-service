@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from universal_connection_service.contracts import ExecutionContext
+from universal_connection_service.contracts import AuthRequirement, ConnectorManifest, ExecutionContext
 from universal_connection_service.control_plane import ControlPlanePrincipal
 from universal_connection_service.mcp_adapter import MCPToolBinding
 from universal_connection_service.mcpb_sandbox import SandboxedMCPConnector, SandboxedMCPConnectorConfig
@@ -122,6 +122,49 @@ def test_tool_profile_isolation_and_approval_scope():
     store.close()
 
 
+class NonSandboxConnector:
+    def __init__(self):
+        self.config = SimpleNamespace()
+
+    def manifest(self):
+        return ConnectorManifest(
+            connectorId="not-sandboxed",
+            serviceId="records",
+            name="Not sandboxed",
+            version="1.0.0",
+            strategy="official_api",
+            capabilities=("records.read",),
+            auth=AuthRequirement(type="none"),
+        )
+
+    async def health_check(self, ctx):
+        return True
+
+    async def execute(self, capability, input, ctx):
+        raise AssertionError("not used")
+
+
+def test_tool_policy_rejects_non_sandbox_connector_even_if_it_has_config():
+    store = SQLiteStateStore(":memory:")
+    registry = ConnectorRegistry(state_store=store)
+    registry.register(Registration(connector=NonSandboxConnector(), status="trusted", organization_id="org-1"))
+    service = SandboxToolPolicyService(registry=registry, evidence_store=store, approval_store=store)
+    with pytest.raises(Exception) as captured:
+        service.issue_approval(
+            principal("approver", "approvals:issue"),
+            "not-sandboxed",
+            SandboxToolProfileApprovalCommand(
+                organizationId="org-1",
+                version="1.0.0",
+                capability="records.read",
+                changeId="tool-policy-change-3",
+                profile=SandboxCapabilityProfile(),
+            ),
+        )
+    assert getattr(captured.value, "code", None) == "SANDBOX_PROFILE_NOT_APPLICABLE"
+    store.close()
+
+
 class FakeMCPClient:
     async def call_tool(self, tool, input):
         return SimpleNamespace(is_error=False, structured_content={"tool": tool, "input": input}, content=[])
@@ -168,11 +211,12 @@ def _docker_available() -> bool:
 
 
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
-def test_managed_gateway_creates_internal_network_and_attaches_alias():
+def test_managed_gateway_uses_unique_internal_execution_network_and_cleans_it_up():
     suffix = uuid4().hex[:10]
     container = f"ucs-gateway-{suffix}"
-    network = f"ucs-internal-{suffix}"
+    prefix = f"ucs-egress-{suffix}"
     alias = f"proxy-{suffix}"
+    leased_networks = []
     try:
         subprocess.run(
             ["docker", "run", "-d", "--name", container, "python:3.12-slim", "sleep", "60"],
@@ -182,29 +226,43 @@ def test_managed_gateway_creates_internal_network_and_attaches_alias():
         )
         manager = DockerSandboxGatewayManager(
             DockerSandboxGatewayConfig(
-                networkName=network,
+                networkName=prefix,
                 gatewayContainer=container,
                 gatewayAlias=alias,
             )
         )
-        first = manager.ensure()
-        second = manager.ensure()
-        assert first.ready is True and second.ready is True
-        internal = subprocess.run(
-            ["docker", "network", "inspect", network, "--format", "{{.Internal}}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        assert internal == "true"
-        networks = subprocess.run(
-            ["docker", "inspect", container, "--format", "{{json .NetworkSettings.Networks}}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        assert network in networks
-        assert alias in networks
+        assert manager.ensure().ready is True
+        assert manager.ensure().ready is True
+
+        for _ in range(2):
+            with manager.lease() as network:
+                leased_networks.append(network)
+                assert network.startswith(prefix + "-")
+                internal = subprocess.run(
+                    ["docker", "network", "inspect", network, "--format", "{{.Internal}}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                assert internal == "true"
+                networks = subprocess.run(
+                    ["docker", "inspect", container, "--format", "{{json .NetworkSettings.Networks}}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                assert network in networks
+                assert alias in networks
+            removed = subprocess.run(
+                ["docker", "network", "inspect", network],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            assert removed.returncode != 0
+
+        assert leased_networks[0] != leased_networks[1]
     finally:
         subprocess.run(["docker", "rm", "-f", container], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["docker", "network", "rm", network], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for network in leased_networks:
+            subprocess.run(["docker", "network", "rm", network], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
