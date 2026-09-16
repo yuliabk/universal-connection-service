@@ -87,13 +87,15 @@ class SandboxToolPolicyService:
 
     def _trusted_connector(self, organization_id: str, connector_id: str, version: str):
         registration = self.registry.exact(organization_id, connector_id, version)
-        if registration is None or registration.status != "trusted" or not isinstance(registration.connector, SandboxedMCPConnector):
-            # Tool-scoped runtime wrappers expose the same config/manifest but are not necessarily the base class.
-            if registration is None or registration.status != "trusted" or not hasattr(registration.connector, "config"):
-                raise ControlPlaneError(
-                    "SANDBOX_PROFILE_NOT_APPLICABLE",
-                    "Sandbox tool profile requires a trusted sandboxed MCP connector",
-                )
+        if (
+            registration is None
+            or registration.status != "trusted"
+            or not isinstance(registration.connector, SandboxedMCPConnector)
+        ):
+            raise ControlPlaneError(
+                "SANDBOX_PROFILE_NOT_APPLICABLE",
+                "Sandbox tool profile requires a trusted sandboxed MCP connector",
+            )
         return registration
 
     def _require_capability(self, organization_id: str, connector_id: str, version: str, capability: str):
@@ -108,8 +110,8 @@ class SandboxToolPolicyService:
 
     @staticmethod
     def _approval_capability(connector_id: str, version: str, capability: str, profile_hash: str) -> str:
-        material = hashlib.sha256(capability.encode("utf-8")).hexdigest()[:16]
-        return f"sandbox.tool-profile:{connector_id}:{version}:{material}:{profile_hash}"
+        capability_ref = hashlib.sha256(capability.encode("utf-8")).hexdigest()[:16]
+        return f"sandbox.tool-profile:{connector_id}:{version}:{capability_ref}:{profile_hash}"
 
     def active_profile(
         self,
@@ -118,7 +120,6 @@ class SandboxToolPolicyService:
         version: str,
         capability: str | None = None,
     ) -> SandboxCapabilityProfile:
-        # Introspection and health checks intentionally receive no capability and therefore no privileges.
         if capability is None or self.evidence_store is None:
             return SandboxCapabilityProfile()
         matches = [
@@ -224,7 +225,10 @@ class SandboxToolPolicyService:
             and record.organization_id == command.organization_id
             and record.service_id == _SANDBOX_TOOL_POLICY_SERVICE
             and record.capability == self._approval_capability(
-                connector_id, command.version, command.capability, profile_hash
+                connector_id,
+                command.version,
+                command.capability,
+                profile_hash,
             )
             and record.operation == "update"
         )
