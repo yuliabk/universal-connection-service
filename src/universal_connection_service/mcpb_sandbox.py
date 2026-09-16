@@ -300,8 +300,8 @@ class DockerMCPBSandboxRunner:
                 raise MCPBSandboxError("SANDBOX_MOUNT_POLICY_UNAVAILABLE", "Sandbox mount policy resolver is unavailable")
             for grant in profile.mounts:
                 binding = self.mount_resolver.resolve(ctx.organization_id, grant)
-                mode = "readonly" if grant.access == "read_only" else "rw"
-                extra_mounts.append(f"type=bind,src={binding.host_path},dst={binding.container_path},{mode}")
+                read_only = ",readonly" if grant.access == "read_only" else ""
+                extra_mounts.append(f"type=bind,src={binding.host_path},dst={binding.container_path}{read_only}")
 
         hosts = tuple(getattr(profile, "egress_hosts", ()))
         if not hosts:
