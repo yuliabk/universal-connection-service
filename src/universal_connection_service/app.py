@@ -25,7 +25,7 @@ from .credentials import AgentVaultCredentialResolver, AgentVaultCredentialResol
 from .discovery import DiscoveryEngine, MCPRegistryConfig, MCPRegistryDiscoveryProvider
 from .mcp_adapter import MCPConnectorAdapter
 from .mcp_validation import MCPValidationService
-from .mcpb_sandbox import DockerMCPBSandboxConfig, DockerMCPBSandboxRunner, SandboxedMCPConnector
+from .mcpb_sandbox import DockerMCPBSandboxConfig, SandboxedMCPConnector
 from .openapi_adapter import OpenAPIConnectorAdapter
 from .packages import ConnectorPackageLoader, CosignBundleVerifier, Ed25519PackageVerifier, FilesystemPackageSource
 from .persistence import SQLiteStateStore, WorkflowStore
@@ -40,7 +40,16 @@ from .sandbox_build import (
     SandboxMCPPackageAcquirer,
 )
 from .sandbox_credentials import AgentVaultSandboxBroker
-from .sandbox_policy import SandboxMountCatalog, SandboxPolicyService, build_sandbox_policy_router
+from .sandbox_managed_runtime import (
+    DockerSandboxGatewayConfig,
+    DockerSandboxGatewayManager,
+    ManagedPolicyDockerMCPBSandboxRunner,
+    SandboxGatewayError,
+    ToolScopedSandboxAwareBuildCoordinator,
+    ToolScopedSandboxedMCPConnector,
+)
+from .sandbox_policy import SandboxMountCatalog
+from .sandbox_tool_policy import SandboxToolPolicyService, build_sandbox_tool_policy_router
 from .service import ConnectionService
 
 
@@ -173,11 +182,35 @@ def _build_package_runtime():
     return ConnectorPackageLoader(source, verifier), openapi_builder, sandbox_builder, mode
 
 
-def _build_sandbox_runner(artifact_store, policy_service, mount_catalog, resolver):
+def _build_gateway_manager():
+    container = os.getenv("UCS_MCP_SANDBOX_GATEWAY_CONTAINER")
+    if not container:
+        return None, "static" if os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK") else "disabled"
+    config = DockerSandboxGatewayConfig(
+        dockerExecutable=os.getenv("UCS_MCP_SANDBOX_DOCKER", "docker"),
+        networkName=os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK", "ucs-sandbox-egress"),
+        gatewayContainer=container,
+        gatewayAlias=os.getenv("UCS_MCP_SANDBOX_EGRESS_PROXY_HOST", "agent-vault-proxy"),
+        startupTimeoutSeconds=float(os.getenv("UCS_MCP_SANDBOX_STARTUP_TIMEOUT", "5")),
+    )
+    return DockerSandboxGatewayManager(config), "managed"
+
+
+def _build_sandbox_runner(artifact_store, policy_service, mount_catalog, resolver, gateway_manager):
     if not _env_bool("UCS_MCP_PACKAGE_SANDBOX_ENABLED"):
         return None, "disabled"
     if artifact_store is None:
         raise RuntimeError("UCS_BUILD_ARTIFACT_DIR is required when MCP package sandboxing is enabled")
+    egress_network = (
+        gateway_manager.config.network_name
+        if gateway_manager is not None
+        else os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK")
+    )
+    egress_proxy_host = (
+        gateway_manager.config.gateway_alias
+        if gateway_manager is not None
+        else os.getenv("UCS_MCP_SANDBOX_EGRESS_PROXY_HOST")
+    )
     config = DockerMCPBSandboxConfig(
         dockerExecutable=os.getenv("UCS_MCP_SANDBOX_DOCKER", "docker"),
         pythonImage=os.getenv("UCS_MCP_SANDBOX_PYTHON_IMAGE", "python:3.12-slim"),
@@ -187,24 +220,25 @@ def _build_sandbox_runner(artifact_store, policy_service, mount_catalog, resolve
         pidsLimit=int(os.getenv("UCS_MCP_SANDBOX_PIDS", "64")),
         tmpfsBytes=int(os.getenv("UCS_MCP_SANDBOX_TMPFS_BYTES", str(64 * 1024 * 1024))),
         startupTimeoutSeconds=float(os.getenv("UCS_MCP_SANDBOX_STARTUP_TIMEOUT", "5")),
-        egressNetwork=os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK"),
-        egressProxyHost=os.getenv("UCS_MCP_SANDBOX_EGRESS_PROXY_HOST"),
+        egressNetwork=egress_network,
+        egressProxyHost=egress_proxy_host,
     )
     broker = AgentVaultSandboxBroker(resolver) if isinstance(resolver, AgentVaultCredentialResolver) else None
-    return DockerMCPBSandboxRunner(
+    return ManagedPolicyDockerMCPBSandboxRunner(
         artifact_store,
         config,
-        profile_provider=policy_service,
+        policy_service=policy_service,
         mount_resolver=mount_catalog,
         credential_broker=broker,
-    ), "docker+policy"
+        gateway_manager=gateway_manager,
+    ), "docker+managed-policy"
 
 
 def _bind_runtime_connector(connector):
     if isinstance(connector, SandboxedMCPConnector):
         if mcp_sandbox_runner is None:
             raise RuntimeError("trusted sandboxed MCP connector cannot rehydrate without the configured sandbox runtime")
-        return connector.with_runner(mcp_sandbox_runner)
+        return ToolScopedSandboxedMCPConnector(connector.config, runner=mcp_sandbox_runner)
     if credential_resolver is None:
         return connector
     if isinstance(connector, OpenAPIConnectorAdapter):
@@ -225,13 +259,15 @@ approval_store = state_store if isinstance(state_store, ApprovalStore) else None
 workflow_store = state_store if isinstance(state_store, WorkflowStore) else None
 approval_verifier = PersistentApprovalVerifier(approval_store) if approval_store is not None else None
 mount_catalog = _build_mount_catalog()
-sandbox_policy_service = SandboxPolicyService(
+sandbox_policy_service = SandboxToolPolicyService(
     registry=registry,
     evidence_store=state_store,
     approval_store=approval_store,
     mount_catalog=mount_catalog,
     require_distinct_approver=_env_bool("UCS_CONTROL_PLANE_REQUIRE_DISTINCT_APPROVER"),
 )
+sandbox_gateway_manager, sandbox_gateway_kind = _build_gateway_manager()
+sandbox_gateway_state = "pending" if sandbox_gateway_manager is not None else sandbox_gateway_kind
 service = ConnectionService(
     registry,
     approval_verifier=approval_verifier,
@@ -257,7 +293,11 @@ artifact_dir = os.getenv("UCS_BUILD_ARTIFACT_DIR")
 generic_artifact_store = FilesystemBuildArtifactStore(artifact_dir) if artifact_dir else None
 mcpb_artifact_store = FilesystemMCPBArtifactStore(artifact_dir) if artifact_dir else None
 mcp_sandbox_runner, mcp_sandbox_kind = _build_sandbox_runner(
-    mcpb_artifact_store, sandbox_policy_service, mount_catalog, credential_resolver
+    mcpb_artifact_store,
+    sandbox_policy_service,
+    mount_catalog,
+    credential_resolver,
+    sandbox_gateway_manager,
 )
 mcp_package_acquirer = MCPPackageAcquirer(generic_artifact_store)
 build_pipeline = ConnectorBuildPipeline(
@@ -274,7 +314,7 @@ build_coordinator = VerifiedBuildCoordinator(
     evidence_store=state_store,
 )
 if mcp_sandbox_runner is not None and mcpb_artifact_store is not None:
-    sandbox_build_coordinator = SandboxAwareBuildCoordinator(
+    base_sandbox_build_coordinator = SandboxAwareBuildCoordinator(
         fallback=build_coordinator,
         runner=mcp_sandbox_runner,
         acquirer=SandboxMCPPackageAcquirer(mcpb_artifact_store),
@@ -282,6 +322,11 @@ if mcp_sandbox_runner is not None and mcpb_artifact_store is not None:
         package_loader=package_loader,
         registry=registry,
         evidence_store=state_store,
+    )
+    sandbox_build_coordinator = ToolScopedSandboxAwareBuildCoordinator(
+        base_sandbox_build_coordinator,
+        runner=mcp_sandbox_runner,
+        registry=registry,
     )
 else:
     sandbox_build_coordinator = None
@@ -321,7 +366,7 @@ build_kind = (
     if auto_connect_orchestrator is not None
     else "disabled"
 )
-sandbox_policy_kind = "approved-profiles" if mcp_sandbox_runner is not None else "disabled"
+sandbox_policy_kind = "per-tool-approved-profiles" if mcp_sandbox_runner is not None else "disabled"
 package_rehydration = RehydrationReport()
 
 
@@ -339,7 +384,14 @@ def _rehydrate_packages() -> RehydrationReport:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global package_rehydration
+    global package_rehydration, sandbox_gateway_state
+    if sandbox_gateway_manager is not None:
+        try:
+            sandbox_gateway_manager.ensure()
+            sandbox_gateway_state = "ready"
+        except SandboxGatewayError:
+            # Zero-capability sandboxing remains available; privileged egress fails closed and retries ensure lazily.
+            sandbox_gateway_state = "unavailable"
     package_rehydration = _rehydrate_packages()
     yield
     close = getattr(state_store, "close", None)
@@ -350,7 +402,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Universal Connection Service", version="0.1.0", lifespan=lifespan)
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
 app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
-app.include_router(build_sandbox_policy_router(sandbox_policy_service, control_plane_authenticator))
+app.include_router(build_sandbox_tool_policy_router(sandbox_policy_service, control_plane_authenticator))
 
 
 @app.get("/health")
@@ -367,6 +419,7 @@ def health():
         "packageVerifier": package_kind,
         "packageSandbox": mcp_sandbox_kind,
         "sandboxPolicy": sandbox_policy_kind,
+        "sandboxGateway": sandbox_gateway_state,
         "packages": {
             "loaded": package_rehydration.loaded,
             "skipped": package_rehydration.skipped,
