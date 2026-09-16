@@ -89,6 +89,7 @@ def grant(
     organization_id="o1",
     capability="records.write",
     operation="update",
+    expires_at=None,
 ):
     return ApprovalGrant(
         approvalId=approval_id,
@@ -99,7 +100,7 @@ def grant(
         serviceId="records",
         capability=capability,
         operation=operation,
-        expiresAt=datetime.now(timezone.utc) + timedelta(minutes=10),
+        expiresAt=expires_at or (datetime.now(timezone.utc) + timedelta(minutes=10)),
     )
 
 
@@ -153,6 +154,19 @@ def test_approval_scope_mismatch_fails_before_execution():
     result = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
     assert result.status == "failed"
     assert result.error.code in {"APPROVAL_SCOPE_MISMATCH", "APPROVAL_INVALID"}
+    assert connector.calls == 0
+
+
+def test_expired_approval_fails_before_execution():
+    verifier = InMemoryApprovalVerifier(
+        (grant(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)),)
+    )
+    svc, connector = service(verifier=verifier)
+    req = request(capability="records.write", operation="update")
+
+    result = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
+    assert result.status == "failed"
+    assert result.error.code == "APPROVAL_EXPIRED"
     assert connector.calls == 0
 
 
