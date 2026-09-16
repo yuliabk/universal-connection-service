@@ -313,8 +313,9 @@ class DurableExecutor:
                     raise ReceiptError("EXECUTION_ACCOUNT_MISMATCH")
             elif hashlib.sha256(ctx.credential_handle.get_secret_value().encode()).hexdigest() not in target.credential_handle_hashes:
                 raise ReceiptError("EXECUTION_ACCOUNT_MISMATCH")
-            digest = execution_binding(req, target.provider_account_id)
             receipt = self.store.get_receipt(req.actor.organization_id, req.operation_id)
+            digest = execution_binding(req, target.provider_account_id,
+                schema_version=receipt.binding_schema_version if receipt else 1)
             if receipt:
                 if (receipt.user_id, receipt.agent_id) != (req.actor.user_id, req.actor.agent_id):
                     receipt = None

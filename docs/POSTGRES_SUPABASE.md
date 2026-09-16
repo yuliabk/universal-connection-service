@@ -84,7 +84,11 @@ ucs_internal.schema_migration
 The current migrations are:
 
 1. connector state, validation/policy evidence, execution audit;
-2. persistent approval grants.
+2. persistent approval grants;
+3. persistent auto-connect workflows;
+4. durable execution receipts, attempts and audit outbox;
+5. operation-bound approvals and encrypted execution results;
+6. tenant-scoped execution operational notices.
 
 Migrations run under a transaction-scoped PostgreSQL advisory lock so two deploy processes cannot apply the same UCS migration concurrently.
 

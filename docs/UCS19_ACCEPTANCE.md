@@ -27,11 +27,11 @@
 1. מומשו recoveryBackoffMs, recoveryNotBefore עמיד ומשותף ל־lookup/replay ו־clockMarginMs. בדיקות פתיחה מחדש, אובדן commit acknowledgement ופקיעה משתמשות בשעון מוזרק; אומת ב־CI של e61a8d8: 332 בדיקות עברו ללא דילוגים (run 35133361136).
 2. נוספו התראות עמידות עם זהות יציבה, מדדי states/backlog/age/notice codes ו־API ארגוני בהרשאת executions:observe. בדיקות restart, בידוד, כשל אחסון ומונים מקבילים נוספו; נדרש CI עדכני.
 3. accepted/pending מתשובת dispatch מאומתת מומש בחוזה dispatchOutcomes ובבדיקת crash/resume. אין הסקת success מ־HTTP accepted; הסעיף אומת ב־CI של a8d4630: 322 בדיקות עברו ללא דילוגים, כולל שני backends (run 35132662022).
-4. ה־design דורש quarantine לראיה סופית סותרת. כיום תוצאה מאוחרת אינה דורסת terminal receipt; זה אינו בפני עצמו מנגנון תיעוד/בירור של סתירה סמכותית.
-5. להשלים fault injection בתהליכים נפרדים לפני/אחרי intent, אחרי dispatch commit ולפני IO, ואחרי result commit לפני תגובת הלקוח/ack של audit. בדיקות transaction וחריגות באותו תהליך הן ראיות משלימות בלבד.
-6. לבדוק מעבר גרסאות binding: כיום canonical hash כולל version=1; יש לקבע במפורש כיצד receipt היסטורית מזוהה כאשר גרסת הנרמול משתנה.
+4. מומשו outcomeConflicted ו־quarantine אטומי עם התראה לתוצאות סופיות מאומתות וסותרות, בשני הכיוונים. נדרשת ראיית CI עדכנית.
+5. נוספה test_execution_crash_matrix.py עם exit אמיתי לפני/אחרי intent, אחרי dispatch, אחרי witness ולפני IO, אחרי result commit ואחרי audit delivery commit. יחד עם בדיקות provider commit ו־pending הקיימות מתקבלת מטריצת הגבולות; נדרשת ראיית CI עדכנית לשני backends.
+6. receipt שומרת bindingSchemaVersion=1 במפורש; receipt היסטורית ללא השדה מפורשת כ־v1. dispatcher מקבל את גרסת ה־receipt וגרסה לא מוכרת נחסמת. test_binding_version.py בודקת תאימות וחסימת גרסה עתידית ללא IO; נדרש CI עדכני.
 7. הצפנת result במנגנון האפליקציה קיימת. receipts/outbox כוללים metadata בטקסט במסד; דרישת הצפנה במנוחה לכל האחסון אינה מוכחת על ידי AES-GCM של payload בלבד. נדרשת הכרעה ומימוש/אכיפה מתאימים; אין לטעון שכבר הוכחה הצפנת כל המסד.
-8. לעדכן README ו־SPEC המתארים יכולות שכבר מומשו כדחויות. להשלים הוראות הפעלה, migration, recovery וגבולות הפריסה לפי הממשקים בפועל.
+8. עודכנו README, SPEC ורשימת migrations ונוסף UCS19_RUNBOOK.md. cryptography הועברה גם לתלות בסיס משום ש־runtime מייבא אותה. בדיקות התקנה ופקודות המסירה בביקורת.
 9. G4.3 דורש סקירת Owner וקבלת התוצאה. יש להציג תוצר ובדיקות מלאים לפני בקשת הקבלה; PR טיוטה ו־CI ירוק אינם ראיה שהסקירה התרחשה.
 
 ## ראיות שנבדקו

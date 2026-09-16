@@ -30,6 +30,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -e '.[dev]'
+      - name: Build distributable wheel
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir dist
+          python -c "import glob, sys; sys.path.insert(0, glob.glob('dist/*.whl')[0]); import universal_connection_service as u; from universal_connection_service.app import app; assert '.whl' in u.__file__; assert '/v1/control-plane/executions/notices' in app.openapi()['paths']"
       - name: Pre-pull MCPB sandbox image
         run: docker pull python:3.12-slim
       - run: python -m pytest -q

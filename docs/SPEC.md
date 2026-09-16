@@ -1,34 +1,34 @@
-# Universal Connection Service - Alpha specification
+# Universal Connection Service — מפרט מערכת
 
-## Goal
+## מטרה וגבולות
 
-Expose business capabilities through one stable contract without forcing callers to know whether the implementation uses MCP, REST/OpenAPI, OAuth, a database, Machine Bridge or controlled browser automation.
+UCS חושף יכולות עסקיות בחוזה יציב, בלי לחייב caller להכיר את transport של המחבר. מתאמי MCP ו־REST/OpenAPI ממומשים; transports נוספים יכולים לממש ConnectorContract. השירות אינו נתב agent-to-agent ואינו מנפיק הרשאות עסקיות בעצמו.
 
-## Boundary
+HTTP execution מאמת bearer, ארגון וצירוף user/agent מורשה לפני גישה לתוצאה או IO. SDK פנימי מניח מארח מאמת. מדיניות, הרשאת API, חשבון ספק ואישור עסקי נבדקים בנפרד. הרשאת review/promotion אינה הרשאת ביצוע.
 
-The service resolves and executes connectors. It is not an agent-to-agent router and does not grant permissions. Calling platforms remain responsible for identity and effective policy; the service verifies the supplied execution context and fails closed.
+## זרימה
 
-## Core flow
+1. לקבל ConnectionRequest עם actor ויכולת, וליצור ConnectionPlan הניתן לסקירה.
+2. לבחור מחבר trusted בארגון ובגרסה המתאימים; מחבר חדש עובר validation ו־promotion מאושר.
+3. לבדוק מדיניות וסיווג effects מהימן. caller אינו יכול להפוך פעולה בעלת השפעה לקריאה באמצעות readOnly.
+4. לפתור credentials בגבול יציאה באמצעות handle אטום ולוודא חשבון מאושר.
+5. לפעולה בעלת השפעה: לקבע operationId ו־binding, לשמור intent, לצרוך אישור ו־dispatch אטומיים ולשמור witness עצמאי לפני IO.
+6. לשמור תוצאה סופית מוצפנת ו־audit outbox באותה טרנזקציה. pending/unknown אינם הצלחה ואינם הרשאה לשליחה רגילה חוזרת.
+7. recovery משתמש בחוזה ספק מקובע, מפתח מקורי, תקציב ומרווח עמידים. תוצאה סותרת מאומתת גוררת quarantine; restore חסר אינו מאפס זהות פעולה.
+8. למסור audit בנפרד, לשמור tombstone אחרי expiry של payload ולאפשר תצפית ארגונית למורשה.
 
-1. Accept a tenant-scoped `ConnectionRequest`.
-2. Compile a reviewable `ConnectionPlan`.
-3. Resolve an exact trusted connector implementation.
-4. Require approval when policy or risk demands it.
-5. Resolve credentials only at the outbound execution boundary.
-6. Validate and normalize the result.
-7. Return an audit identifier with every result.
+## יכולות ומסמכי חוזה
 
-## Alpha acceptance scenarios
+חוזי runtime נמצאים ב־contracts.py. תכנון policy ואישורים מתועד ב־POLICY_APPROVAL.md; אחסון ב־PERSISTENCE.md ו־POSTGRES_SUPABASE.md; lifecycle ב־CONTROL_PLANE.md; גילוי/build/sandbox במסמכים הייעודיים. UCS-19 מתועד ב־DURABLE_EXECUTION.md, ומיפוי דרישות לראיות ב־UCS19_ACCEPTANCE.md. פקודות הפעלה והתאוששות מרוכזות ב־UCS19_RUNBOOK.md.
 
-1. Unknown service produces a build-and-validation plan and execution fails with `CONNECTION_UNAVAILABLE`.
-2. Trusted read connector can be resolved by service and capability without exposing credentials.
-3. Write, destructive, financial or permission-increasing operations require human approval.
+## תרחישי קבלה
 
-## Deferred before public production
+- שירות ללא מחבר מאושר מחזיר תכנון לבנייה/אימות ונחסם בביצוע.
+- קריאה מאושרת מזוהה לפי service/capability בלי חשיפת credentials; סיווג חסר מחייב סקירת host.
+- כתיבה, מחיקה, פעולה פיננסית והגדלת הרשאות דורשות אישור אנושי קשור ואחסון עמיד.
+- retry של אותה פעולה לאחר crash מחזיר תוצאה קיימת או עוצר לבירור, בלי השפעה כפולה.
+- תחרות workers, כשל commit, pending, אישור פג/מבוטל, tenant isolation ו־audit outage מכוסים בבדיקות סינתטיות. מטריצת UCS-19 מפרטת את גבולות הראיה והפערים שטרם נסגרו.
 
-- persistent tenant-scoped registry and audit store;
-- vault-backed credential resolver and OAuth callback service;
-- policy engine and approval verification;
-- signed connector packages and supply-chain verification;
-- REST/OpenAPI and MCP adapters with SSRF and schema-drift protection;
-- rate limiting, observability, deployment and rollback evidence.
+## מחוץ להוכחת המסירה הנוכחית
+
+פריסת Production, חוזה ספק אמיתי, OAuth callback service, מפתחות ונתוני לקוח אמיתיים, RPO/RTO ותשתית ניטור חיצונית אינם מוכחים על ידי הבדיקות הסינתטיות. הצפנת metadata במנוחה נותרה פער מפורש בביקורת UCS-19; הצפנת payload ו־TLS אינם מכסים אותו לבדם. אין להסיק אישור Production ממעבר CI.

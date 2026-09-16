@@ -227,3 +227,11 @@ replay נחסם כאשר now + clockMarginMs מגיע ל־providerNotAfter; גם
 שתי ראיות לאותו מצב סופי אינן סתירה בפני עצמן. אי־התאמת key/account/binding/contract או תשובה שלא עברה אימות אינן ראיה סמכותית שמאפשרת לשנות receipt. תוצאה שהגיעה אחרי ביטול/timeout ונזרקה ב־ProviderCalls אינה עוברת להמשך coordinator; מגבלת האמון הזו נשארת כפי שתועדה בסעיף cancellation. כשל בשמירת בדיקת הסתירה אינו מוחזר כהצלחה קיימת לבקשה שזיהתה אותו; האחסון חייב לחזור לפעולה כדי לקבע quarantine עמידה.
 
 בדיקות test_outcome_conflicts.py מריצות שני lookups חופפים בשני הכיוונים, בודקות תשובות מסכימות לצד סותרות, מאמתות שמירת ciphertext/outbox, חסימת גישה אחרי פתיחה מחדש, ו־rollback אטומי כששמירת ההתראה נכשלת. locally: 244 בדיקות עברו ו־108 דולגו בהעדר PostgreSQL/Docker; נדרש CI עדכני.
+
+### G4 — מטריצת קריסות, גרסת binding וחבילת הפצה
+
+נוספה test_execution_crash_matrix.py: תהליך ילד מסתיים ב־exit(42) לפני intent, אחרי intent, אחרי dispatch commit, אחרי witness commit ולפני IO, אחרי result commit ולפני תשובה, ואחרי audit delivery commit. מופע חדש בודק האם מותר להמשיך או נדרש unknown/quarantine, וסופר השפעות ב־ledger ספק עצמאי. אם dispatch נשמר אבל witness טרם נשמר, העצירה היא quarantine ולא ניסיון חדש. בדיקות אלה משלימות את קריסת provider commit ואת קריסת pending שתועדו קודם.
+
+ExecutionIntent/Receipt שומרים bindingSchemaVersion=1 במפורש. היעדר השדה ב־receipt ישנה מפורש כ־v1 בלבד; אין שכתוב של digest היסטורי. חישוב binding מקבל את הגרסה שנשמרה; גרסה שאינה נתמכת נחסמת בלי IO. תמיכה עתידית בגרסה נוספת תחייב מימוש מפורש המשמר את אלגוריתם v1 ומבחני מעבר.
+
+README, SPEC, תיעוד מיגרציות ו־UCS19_RUNBOOK.md עודכנו לפי המימוש. cryptography נוספה לתלויות הבסיס מפני שה־runtime מייבא אותה גם ללא extras. נבנה wheel מקומי, נטען ממנו app ונבדקה סכימת OpenAPI עם 23 paths; CI כולל כעת build ו־import מה־wheel. הרגרסיה המקומית עברה עם 255 בדיקות ו־115 דילוגים בהיעדר PostgreSQL/Docker. המטריצה מחייבת CI עדכני בשני backends; הצפנת metadata וקבלת Owner עדיין לא הוכחו.

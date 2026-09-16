@@ -18,8 +18,10 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def execution_binding(request: ConnectionRequest, provider_account_id: str) -> str:
+def execution_binding(request: ConnectionRequest, provider_account_id: str, *, schema_version: int = 1) -> str:
     """Versioned canonical binding; rejects ambiguous/non-JSON values."""
+    if type(schema_version) is not int or schema_version != 1:
+        raise ReceiptError("BINDING_SCHEMA_UNSUPPORTED")
     def validate(value):
         if isinstance(value, dict):
             if any(not isinstance(key, str) for key in value):
@@ -53,6 +55,8 @@ class ReceiptError(RuntimeError):
 
 
 class ExecutionIntent(Model):
+    # Missing on historical receipts means v1; never silently reinterpret v1.
+    binding_schema_version: Literal[1] = Field(alias="bindingSchemaVersion", default=1)
     organization_id: str = Field(alias="organizationId", min_length=1)
     operation_id: str = Field(alias="operationId", min_length=1, max_length=200)
     request_id: str = Field(alias="requestId", min_length=1)
