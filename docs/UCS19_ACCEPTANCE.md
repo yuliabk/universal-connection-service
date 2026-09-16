@@ -1,43 +1,36 @@
 # UCS-19 — ביקורת קבלה לפי דרישות
 
-מצב: בביצוע. מעבר CI אינו מוכיח שכל סעיפי המפרט הושלמו. מקור הדרישות הוא מסמכי UCS-19 שנכתבו לפני המימוש (proposal, design, tasks ו־capability spec), והדרישות ב־DURABLE_EXECUTION.md. בקשת ה־Owner להשלים את UCS אישרה התקדמות במימוש; אין כאן אישור Production או סקירת קבלה של Owner שכבר התקיימה.
+מצב: מימוש מנגנוני האמינות הושלם ונמצא באימות סופי. הצפנת metadata במנוחה וסקירת Owner נשארות פתוחות. מקור הדרישות הוא אפיון UCS-19 ו־DURABLE_EXECUTION.md. בקשת ה־Owner להשלים את UCS אישרה מימוש; אין כאן אישור Production או טענה שסקירת הקבלה כבר התקיימה.
 
-## מטריצת הדרישות והתרחישים
+## מטריצת דרישות וראיות
 
-| דרישה ותרחיש | ראיה בקוד ובבדיקות | הערכת השלמה |
+| דרישה ותרחיש | ראיות | גבולות |
 | --- | --- | --- |
-| 001: אותה פעולה, requestId חדש ו־restart | execution_binding, prepare_receipt; test_restart_retry_returns_encrypted_result_without_consuming_again, test_reopen_returns_original_receipt_and_same_provider_key | מכוסה ב־SQLite וב־PostgreSQL; תהליך עסקי חיצוני חייב לשמר operationId |
-| 001: שינוי יעד או סכום | binding קנוני כולל actor/account/input; test_key_conflict_cannot_overwrite_intent, test_changed_input_conflicts_even_after_success | מכוסה; schemaVersion נמצא בחומר ה־hash, אך אינו שדה עצמאי ב־receipt כפי שהוצע ב־design |
-| 002: כשל שמירה או אובדן commit acknowledgement | prepare/begin_dispatch לפני IO, transaction approval ו־witness; בדיקות lost_dispatch_commit_ack, lost_replay_commit_ack ו־dispatch_witness | מכוסה בכשל מוזרק; טרם הוכחו כל נקודות הקריסה בתהליך נפרד בשני backends |
-| 002: שני workers | CAS ו־unique key; test_concurrent_instances_have_one_dispatch_winner, test_two_service_instances_share_one_approval_and_effect | מכוסה בשני backends; בדיקות אלה משתמשות במופעים/threads |
-| 003: הצלחת ספק ואז crash | test_process_crash_after_provider_commit_then_keyed_lookup_recovers | מכוסה בתהליך ילד עם exit(42), מונה ספק עצמאי ופתיחה מחדש בשני backends; CI 2923b21 |
-| 003: accepted אסינכרוני | חוזה dispatchOutcomes מקובע, ProviderOutcome עם בדיקת key/account/binding/contract; test_dispatch_outcomes.py | מומש pending מ־dispatch, ללא replay בזמן pending; בדיקת exit אחרי pending commit וחידוש ב־lookup בשני backends נוספה ומחייבת CI עדכני |
-| 004: replay מוגן | RecoveryContract, ReplayPolicy, begin_receipt_replay; test_execution_replay.py | מכוסה בספק סינתטי בעל dedup אטומי ואכיפת notAfter; אין ספק Production מאושר |
-| 004: חלון שפג / lookup לא החלטי / none | test_unresolved_lookup_never_reexecutes_and_budget_survives_restart, test_expired_dispatch_is_rejected_locally_and_by_provider_after_cache_eviction | מכוסה; נוספו backoff משותף עמיד ומרווח שעון מפורשים ב־test_recovery_timing.py; מחייב CI עדכני |
-| 005: אישור בוטל אחרי כשל | begin_receipt_replay מאמת את האישור המקורי תחת transaction; test_replay_requires_original_still_valid_approval | מכוסה revoked/expired/replacement/missing בשני backends |
-| 005: tenant ו־actor | execution_api, executionActors, target account/credential binding; test_execution_auth.py, test_result_access_rechecks_policy_and_actor_before_decryption | מכוסה בגבולות HTTP ו־auto-connect; SDK מניח מארח מאמת |
-| 005: עובד ישן חוזר | test_stale_execution_process.py מחזיק ילד חי לפני/אחרי אפקט הספק, מבצע replay בהורה ואז משחרר אותו | נוספה הוכחה ל־receipt סופית שאינה נדרסת, השפעה יחידה ואירוע outbox יחיד; PostgreSQL דורש CI לגרסה זו |
-| 006: audit לא זמין / acknowledgement אבד | complete_receipt + outbox באותה transaction; deliver_receipt_audit; test_receipt_audit.py | מכוסה מסירה אידמפוטנטית ו־rollback בשני backends; מצב delivery נשמר בטבלת outbox נפרדת ולא בשדה receipt |
-| 007: payload פג / restore ישן | test_receipt_retention.py, test_dispatch_witness.py | מכוסה מחיקת ciphertext בלי שחרור זהות, ו־quarantine כש־primary מפגר אחרי witness; הפעלה דורשת witness שלא שוחזר לאחור יחד עמו |
-| 007: תקציב בירור נגמר | lookup_count/maxLookups, maxAttempts/deadlines; בדיקות recovery/replay | עצירת IO מכוסה; נוספו execution_notice עמיד ו־notices/metrics עם הרשאת executions:observe; מחייב CI עדכני |
-| 008: חלון הקריסה הקריטי | provider ledger נפרד, child exit, receipt/outbox ושחזור | מכוסה; מטריצת כל נקודות הקריסה והמצבים בין תהליכים עדיין אינה מלאה |
+| 001: אותה פעולה אחרי restart ו־requestId חדש | test_receipts.py, test_durable_execution.py; זהות organization/operation, binding קנוני ומפתח ספק יציב | התהליך העסקי חייב לשמר operationId; תוכן זהה אינו בהכרח אותה פעולה |
+| 001: שינוי actor/יעד/סכום או גרסת binding | test_binding_version.py ובדיקות conflict; bindingSchemaVersion=1 נשמר, רשומה היסטורית ללא השדה מפורשת כ־v1 | גרסה לא מוכרת נחסמת ללא IO |
+| 002: כוונה לפני IO, צריכת אישור אטומית ותחרות | CAS, unique constraints, approval transaction; test_receipts.py, test_durable_execution.py | commit acknowledgement חסר אינו הרשאה לשליחה |
+| 002/008: קריסות בגבולות commit | test_execution_crash_matrix.py: לפני/אחרי intent, אחרי dispatch, אחרי witness ולפני IO, אחרי result commit ואחרי audit delivery commit | ילד נפרד יוצא בקוד 42; restart ומונה השפעות ספק עצמאי |
+| 003: הצלחת ספק לפני קריסה | test_process_crash_after_provider_commit_then_keyed_lookup_recovers | התאוששות ב־lookup מאומת; אין הנחה שספק אחר מקיים אותו חוזה |
+| 003: pending אסינכרוני | test_dispatch_outcomes.py; dispatchOutcomes מקובע, התאמת key/account/binding/contract וחידוש אחרי crash | pending אינו גורר replay; HTTP accepted לבדו אינו success |
+| 004: replay מוגן, חלון שפג ותקציב בירור | test_execution_replay.py, test_execution_recovery.py, test_recovery_timing.py | אותו מפתח וחשבון, notAfter נאכף בספק הסינתטי, backoff עמיד משותף ו־clockMarginMs |
+| 005: אישור מבוטל/פג ותחומי הרשאה | test_execution_auth.py, בדיקות revocation/expiry והחזרת result | actor וארגון נבדקים לפני IO או פענוח; SDK מניח מארח מאמת |
+| 005: worker ישן ותוצאות סותרות | test_stale_execution_process.py, test_outcome_conflicts.py | terminal אינו נדרס; סתירה סמכותית גוררת quarantine והתראה אטומיים; אין endpoint לאיפוס |
+| 006: כשל audit ואובדן acknowledgement | test_receipt_audit.py; result ו־outbox בטרנזקציה אחת, eventId יציב ומסירה אידמפוטנטית | מצב המסירה בטבלת outbox; מסירה אינה מפעילה ספק |
+| 007: expiry של payload ו־restore | test_receipt_retention.py, test_dispatch_witness.py | ciphertext נמחק בלי לשחרר זהות; witness חייב להישמר בנפרד ולא להיות משוחזר לאחור עם primary |
+| 007: תקציבים, התראות ומדדים | test_execution_observability.py, בדיקות recovery/replay; notices/metrics עם executions:observe | inbox מקומי עמיד; אין טענת מסירה למערכת ניטור חיצונית |
+| 007: רשומה פגומה אינה עוצרת retention | test_invalid_receipt_cannot_starve_later_retention_pages, עם גרסה עתידית ו־JSON פגום | הרשומה החשודה וה־ciphertext נשמרים; cursor עובר לרשומות הבאות |
+| 008: אריזה ותאימות runtime | CI בונה wheel וטוען ממנו app/OpenAPI; בדיקות UCS הקיימות נשארות ברגרסיה | Docker ו־PostgreSQL נבדקים ב־CI; אינם מותקנים בסביבת הבדיקה המקומית |
 
-## סעיפים נוספים מה־design ומ־tasks שאינם סגורים
+## ראיות הריצה העדכניות
 
-1. מומשו recoveryBackoffMs, recoveryNotBefore עמיד ומשותף ל־lookup/replay ו־clockMarginMs. בדיקות פתיחה מחדש, אובדן commit acknowledgement ופקיעה משתמשות בשעון מוזרק; אומת ב־CI של e61a8d8: 332 בדיקות עברו ללא דילוגים (run 35133361136).
-2. נוספו התראות עמידות עם זהות יציבה, מדדי states/backlog/age/notice codes ו־API ארגוני בהרשאת executions:observe. בדיקות restart, בידוד, כשל אחסון ומונים מקבילים נוספו; נדרש CI עדכני.
-3. accepted/pending מתשובת dispatch מאומתת מומש בחוזה dispatchOutcomes ובבדיקת crash/resume. אין הסקת success מ־HTTP accepted; הסעיף אומת ב־CI של a8d4630: 322 בדיקות עברו ללא דילוגים, כולל שני backends (run 35132662022).
-4. מומשו outcomeConflicted ו־quarantine אטומי עם התראה לתוצאות סופיות מאומתות וסותרות, בשני הכיוונים. נדרשת ראיית CI עדכנית.
-5. נוספה test_execution_crash_matrix.py עם exit אמיתי לפני/אחרי intent, אחרי dispatch, אחרי witness ולפני IO, אחרי result commit ואחרי audit delivery commit. יחד עם בדיקות provider commit ו־pending הקיימות מתקבלת מטריצת הגבולות; נדרשת ראיית CI עדכנית לשני backends.
-6. receipt שומרת bindingSchemaVersion=1 במפורש; receipt היסטורית ללא השדה מפורשת כ־v1. dispatcher מקבל את גרסת ה־receipt וגרסה לא מוכרת נחסמת. test_binding_version.py בודקת תאימות וחסימת גרסה עתידית ללא IO; נדרש CI עדכני.
-7. הצפנת result במנגנון האפליקציה קיימת. receipts/outbox כוללים metadata בטקסט במסד; דרישת הצפנה במנוחה לכל האחסון אינה מוכחת על ידי AES-GCM של payload בלבד. נדרשת הכרעה ומימוש/אכיפה מתאימים; אין לטעון שכבר הוכחה הצפנת כל המסד.
-8. עודכנו README, SPEC ורשימת migrations ונוסף UCS19_RUNBOOK.md. cryptography הועברה גם לתלות בסיס משום ש־runtime מייבא אותה. בדיקות התקנה ופקודות המסירה בביקורת.
-9. G4.3 דורש סקירת Owner וקבלת התוצאה. יש להציג תוצר ובדיקות מלאים לפני בקשת הקבלה; PR טיוטה ו־CI ירוק אינם ראיה שהסקירה התרחשה.
+- הרגרסיה המקומית אחרי תיקון retention: 257 עברו, 117 דולגו בשל היעדר PostgreSQL/Docker; אזהרת deprecation אחת בתלות Starlette.
+- [CI ב־f02875a](https://github.com/yuliabk/universal-connection-service/actions/runs/35140519971): כל 374 הבדיקות עברו ללא דילוגים, כולל PostgreSQL 16 ו־Docker; גם בניית wheel וטעינת האפליקציה ממנו עברו.
+- הריצה הקודמת ב־2faf78b גילתה שרשומה בעלת bindingSchemaVersion לא מוכר עוצרת סריקת retention. התיקון אינו מוחק את הרשומה או מרכך את חסימת הביצוע: הוא מפריד בין cursor של הסריקה לאימות כל מסמך וממשיך לדף הבא.
+- fixtures משתמשים בנתונים סינתטיים ובספק עם ledger עצמאי. הם אינם מוכיחים חוזה של ספק Production, RPO/RTO או הפרדת failure domains בפריסה.
 
-## ראיות שנבדקו
+## סעיפים שנותרו פתוחים
 
-- commit `2923b21`: [CI עם 291 בדיקות שעברו, ללא דילוגים](https://github.com/yuliabk/universal-connection-service/actions/runs/35131204702), כולל PostgreSQL 16 ו־Docker.
-- לאחר הוספת בדיקות העובד החי: 213 בדיקות מקומיות עברו, 82 דולגו בהיעדר PostgreSQL/Docker. בדיקת הבידוד בין תהליכים עברה מקומית בשני תזמוני SQLite; PostgreSQL עדיין מחייב CI עדכני.
-- fixtures משתמשים בנתונים סינתטיים ובספק נפרד לוגית עם ledger SQLite. הם אינם מוכיחים חוזה של ספק אמיתי, התנהגות רשת Production או הפרדת failure domains של witness בפריסה.
+1. **הצפנת metadata במנוחה.** תוצאות מוצפנות ב־AES-GCM; receipts, indexes, outbox, audit, approvals ו־witness עדיין כוללים metadata קריא בשכבת האחסון. TLS אינו מכסה דיסק או גיבויים. נדרשת בחירת יעד מסירה: הצפנה בשכבת האפליקציה בשני backends, או אחסון מוצפן בפריסה מוגדרת עם ראיות מתאימות. אין לסמן סעיף זה כהושלם על סמך דגל תצורה או הצפנת payload בלבד.
+2. **G4.3 — סקירת Owner וקבלת תוצר.** PR טיוטה ומעבר CI אינם מעידים שהסקירה התקיימה. יש להציג את המימוש, בדיקותיו והפער שנותר לפני קבלה סופית.
 
-G1/G2 הושלמו בהיקף המתועד. G3/G4 נשארים פתוחים עד סגירת הסעיפים לעיל והצגת ראיות תואמות לכל סעיף.
+פקודות הפעלה, טיפול במצבים וגבולות restore מתועדים ב־[UCS19_RUNBOOK.md](UCS19_RUNBOOK.md). פריסה או כתיבה לספק אמיתי דורשות היקף ואישור נפרדים.

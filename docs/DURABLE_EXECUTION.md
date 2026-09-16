@@ -235,3 +235,9 @@ replay נחסם כאשר now + clockMarginMs מגיע ל־providerNotAfter; גם
 ExecutionIntent/Receipt שומרים bindingSchemaVersion=1 במפורש. היעדר השדה ב־receipt ישנה מפורש כ־v1 בלבד; אין שכתוב של digest היסטורי. חישוב binding מקבל את הגרסה שנשמרה; גרסה שאינה נתמכת נחסמת בלי IO. תמיכה עתידית בגרסה נוספת תחייב מימוש מפורש המשמר את אלגוריתם v1 ומבחני מעבר.
 
 README, SPEC, תיעוד מיגרציות ו־UCS19_RUNBOOK.md עודכנו לפי המימוש. cryptography נוספה לתלויות הבסיס מפני שה־runtime מייבא אותה גם ללא extras. נבנה wheel מקומי, נטען ממנו app ונבדקה סכימת OpenAPI עם 23 paths; CI כולל כעת build ו־import מה־wheel. הרגרסיה המקומית עברה עם 255 בדיקות ו־115 דילוגים בהיעדר PostgreSQL/Docker. המטריצה מחייבת CI עדכני בשני backends; הצפנת metadata וקבלת Owner עדיין לא הוכחו.
+
+## תיקון סריקת retention וראיית הקבלה העדכנית
+
+הרצת CI חשפה שרשומה עם bindingSchemaVersion עתידי עוצרת את סריקת התוצאות של כל הארגונים. receipt_result_page מחזיר כעת דף גולמי עם cursor מה־index; ה־worker מאמת כל מסמך בנפרד לפני בחינת expiry. מסמך לא נתמך או פגום נשאר ללא שינוי ואינו חוסם דפים מאוחרים. לא הוקלה חסימת הביצוע של גרסה לא מוכרת ולא נמחקת זהות פעולה.
+
+ב־f02875a עברו [374 בדיקות ב־CI](https://github.com/yuliabk/universal-connection-service/actions/runs/35140519971), ללא דילוגים, כולל PostgreSQL 16 ו־Docker. בניית wheel וטעינת app ממנו עברו באותו job. הרגרסיה המקומית עברה עם 257 בדיקות ו־117 דילוגים. מטריצת הקבלה העדכנית מחליפה את סטטוסי הביניים לעיל; הצפנת metadata במנוחה וקבלת Owner עדיין פתוחות.
