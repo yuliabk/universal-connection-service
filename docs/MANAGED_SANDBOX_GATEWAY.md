@@ -2,74 +2,53 @@
 
 ## Goal
 
-UCS-15 introduced approved sandbox capability profiles, but two operational gaps remained:
+UCS-16 removes two broad privilege boundaries left by UCS-15:
 
-1. egress required an operator-prepared Docker internal network and proxy attachment;
-2. privileges were connector-version scoped, so every tool exposed by the same trusted connector shared the same runtime profile.
-
-UCS-16 closes both gaps.
+1. sandbox privileges become capability/tool scoped instead of connector-wide;
+2. egress uses a UCS-managed ephemeral Docker network per execution instead of a shared prepared network.
 
 ```text
 trusted MCPB connector
-        |
-        +-- capability A -> profile A -> sandbox execution A
-        |
-        +-- capability B -> profile B -> sandbox execution B
+   -> capability A -> profile A
+   -> capability B -> profile B
 
-managed egress path:
-MCPB sandbox
-   -> Docker internal network managed by UCS
-   -> existing Agent Vault / broker container attached by UCS
-   -> broker-controlled outbound destination
+privileged tool call
+   -> create unique Docker internal network
+   -> attach existing broker/gateway container with UCS alias
+   -> start one sandbox on that network
+   -> execute tool through broker
+   -> stop sandbox
+   -> detach gateway
+   -> delete network
 ```
 
-The MCPB process never receives Docker access and never chooses its network, gateway, mounts or credentials.
+The MCPB never receives Docker access and never chooses its network, gateway, mounts or credentials.
 
 ## Per-capability policy
 
-A sandbox profile is now activated for the tuple:
+A profile is active only for:
 
 ```text
-organization
-connectorId
-connectorVersion
-capability
-profileHash
+organization + connectorId + version + capability + profileHash
 ```
 
-The profile body remains the UCS-15 safe structure:
+The safe profile body remains:
 
 ```json
 {
   "egressHosts": ["api.example.com"],
-  "mounts": [
-    {"mountId": "client-files", "access": "read_only"}
-  ],
+  "mounts": [{"mountId": "client-files", "access": "read_only"}],
   "brokeredCredentials": true
 }
 ```
 
-The capability is supplied separately in the control-plane command and is included in the approval scope.
+The capability is a separate field in the approval/apply command. The one-time approval is cryptographically scoped to that exact capability and profile hash.
 
-Examples:
+Approval for `records.read` cannot activate `records.delete`, even when both tools belong to the same MCP server and use an identical profile body.
 
-```text
-records.read
-  -> read-only client-files mount
-  -> no network
+## Zero-privilege health and validation
 
-records.delete
-  -> no mounts
-  -> api.records.example through broker
-```
-
-Approval for `records.read` cannot be replayed for `records.delete`, even with an identical profile body.
-
-## Zero-privilege introspection
-
-`health_check`, `list_tools`, package validation and build-time MCP negotiation do not select a business capability.
-
-Therefore they always receive the empty profile:
+`health_check`, `list_tools`, package validation and build-time MCP negotiation do not select a business capability. They therefore use the empty profile:
 
 ```text
 network = none
@@ -79,17 +58,15 @@ broker credentials = none
 
 Privileges are selected only immediately before execution of the requested capability.
 
-## Migration from UCS-15
+## UCS-15 migration boundary
 
-Existing `sandbox_profile_activated` evidence from UCS-15 is retained for audit history but is not treated as an active UCS-16 tool policy.
+Historical `sandbox_profile_activated` evidence is retained for audit but is not inherited by UCS-16.
 
-This is intentional. Automatically translating one connector-wide profile into every tool would widen privileges without a new human approval.
+Automatically applying an old connector-wide profile to every tool would widen privileges without fresh approval. Operators must approve the intended profile for each capability.
 
-Operators must approve the intended profile separately for each capability.
+## Control plane
 
-## Control-plane flow
-
-Endpoints remain under the same connector namespace but are capability-aware:
+Routes remain:
 
 ```text
 GET  /v1/control-plane/connectors/{connectorId}/sandbox-profile
@@ -97,24 +74,22 @@ POST /v1/control-plane/connectors/{connectorId}/sandbox-profile-approval
 POST /v1/control-plane/connectors/{connectorId}/sandbox-profile
 ```
 
-The GET route requires a `capability` query parameter. Approval/apply bodies include `capability`.
+The GET route now requires `capability`. Approval/apply bodies also include `capability`.
 
 Governance remains:
 
 ```text
-approvals:issue
-    -> one-time approval bound to exact capability + profile hash
-connectors:promote
-    -> activate exact approved profile
+approvals:issue -> one-time exact capability/profile approval
+connectors:promote -> activate exact approved profile
 ```
 
 `UCS_CONTROL_PLANE_REQUIRE_DISTINCT_APPROVER=true` still enforces separate approver and applier identities.
 
-## Managed Docker gateway
+## Managed gateway
 
-When configured, UCS manages the network boundary around an existing credential-broker container.
+UCS manages the network lifecycle around an existing broker container. It does not create the secrets backend itself.
 
-Runtime configuration:
+Configuration:
 
 ```text
 UCS_MCP_SANDBOX_GATEWAY_CONTAINER=agent-vault
@@ -122,43 +97,30 @@ UCS_MCP_SANDBOX_EGRESS_NETWORK=ucs-sandbox-egress
 UCS_MCP_SANDBOX_EGRESS_PROXY_HOST=agent-vault-proxy
 ```
 
-If `UCS_MCP_SANDBOX_GATEWAY_CONTAINER` is set, UCS performs an idempotent `ensure` operation:
+`UCS_MCP_SANDBOX_EGRESS_NETWORK` is now a **network-name prefix** in managed mode.
 
-1. inspect the configured network;
-2. create it as an internal bridge if it does not exist;
-3. verify `Internal=true` and `Driver=bridge`;
-4. verify the configured gateway container is running;
-5. connect the gateway container to the internal network when needed;
-6. attach the configured network-scoped alias;
-7. re-read state and fail closed on mismatch.
+At startup, `ensure()` verifies Docker is reachable and the configured gateway container is running. It does not create a shared execution network.
 
-Network creation uses the equivalent of:
+For every capability execution that actually needs egress, UCS creates a unique lease network similar to:
 
 ```text
 docker network create \
   --driver bridge \
   --internal \
   --label io.universal-connection-service.sandbox-gateway=true \
-  ucs-sandbox-egress
+  --label io.universal-connection-service.sandbox-gateway-lease=true \
+  ucs-sandbox-egress-<random>
 ```
 
-UCS does not create the secrets backend itself. The gateway container is still operator-provisioned because its own credentials, storage and lifecycle are deployment concerns.
+UCS verifies the network is internal, bridge-based and has both UCS labels, then connects the broker container with the configured network-scoped alias. After the sandbox process exits, UCS forcibly disconnects the broker and removes the lease network.
 
-## Startup and repair behavior
+This prevents two concurrent sandbox executions from sharing a network and removes lateral sandbox-to-sandbox communication through a long-lived bridge.
 
-At FastAPI startup UCS attempts to ensure the managed gateway.
+## Docker security boundary
 
-A gateway failure does not disable zero-capability MCPB validation or local sandbox execution. Health reports the gateway as unavailable and any capability requiring egress fails closed.
+Docker documents `--internal` networks as externally isolated while still permitting communication between members of that specific network. UCS uses that only for the one sandbox-to-gateway hop. citeturn778027search0turn778027search1
 
-Before every privileged egress execution the managed runner calls `ensure()` again. This provides lightweight self-repair for a deleted network or detached gateway without allowing a fallback to Docker's default bridge.
-
-## Network security
-
-Docker documents `--internal` networks as externally isolated while still allowing communication among containers on the same network. UCS relies on that property for the MCPB-to-gateway hop.
-
-The sandbox container is connected only to the managed internal network. The credential-broker container may separately have its own operator-managed outbound connectivity.
-
-The sandbox still has:
+The sandbox still runs with:
 
 ```text
 --read-only
@@ -169,32 +131,30 @@ PID/CPU/memory limits
 immutable local runtime image ID
 ```
 
-No Docker socket is mounted into the sandbox.
+No Docker socket is mounted into the MCPB sandbox.
 
 ## Credential boundary
 
-Agent Vault integration remains brokered:
+Agent Vault/Agent Proxy style credential brokering remains the only supported HTTP(S) egress path:
 
-- the opaque credential handle stays in UCS execution context;
+- the opaque credential handle remains in UCS execution context;
 - UCS mints a short-lived proxy session;
-- the upstream API credential never enters UCS or MCPB;
-- the requested egress host set must exactly match the credential binding host set;
-- proxy token and CA are temporary execution material only;
-- raw handles and proxy tokens are not persisted in audit/evidence.
+- upstream API credentials never enter the MCPB process;
+- approved egress hosts must exactly match the credential binding host set;
+- proxy token and CA exist only for the execution;
+- raw handles, proxy tokens and approval IDs are never persisted.
 
-Infisical's current Agent Proxy/Agent Vault architecture follows the same credential-brokering principle: credentials are attached at the network boundary rather than exposed to the agent process.
+Infisical describes the same credential-brokering model: requests pass through a proxy that attaches credentials at the network boundary rather than exposing them to the agent process. citeturn778027search5
 
-## Runtime wrapping and restart
+## Runtime and restart
 
-New MCPB connectors are initially validated with the zero-capability UCS-14 runner. After validation the runtime registration is wrapped with `ToolScopedSandboxedMCPConnector`.
+MCPB validation continues with the zero-capability UCS-14 runner. After successful build, the runtime registration is wrapped with `ToolScopedSandboxedMCPConnector`.
 
-Signed connector packages still serialize only the existing sandbox connector config. On restart, UCS-08 package verification runs first, then the runtime binder wraps the verified connector with the tool-scoped managed runner.
-
-This preserves package compatibility while keeping runtime privileges outside the signed connector artifact.
+Signed packages remain compatible with UCS-14 because they serialize only the sandbox connector config. After restart, UCS-08 verifies the signed package first, then the runtime binder attaches the tool-scoped managed runner.
 
 ## Health
 
-Relevant health fields:
+Aggregate health fields:
 
 ```json
 {
@@ -204,17 +164,7 @@ Relevant health fields:
 }
 ```
 
-Possible gateway states include:
-
-```text
-managed/pending
-ready
-unavailable
-static
-disabled
-```
-
-No gateway container name, network secrets, egress host lists, mount paths or credential handles are returned.
+Possible gateway states are `pending`, `ready`, `unavailable`, `static`, or `disabled`. Health never exposes container names, network lease names, egress hosts, mount paths, credentials or proxy tokens.
 
 ## Acceptance criteria
 
@@ -223,24 +173,23 @@ UCS-16 is ready when CI proves that:
 1. profiles are capability-scoped;
 2. one capability cannot inherit another capability's profile;
 3. an approval for capability A cannot activate capability B;
-4. health checks and introspection stay zero-privilege;
-5. a requested tool executes with only its own capability profile selected;
-6. the managed gateway creates an internal bridge network when absent;
-7. the gateway container is attached with the configured network alias;
-8. repeated gateway `ensure()` calls are idempotent;
-9. privileged execution re-checks/repairs the managed gateway;
-10. no fallback to Docker's ordinary bridge network exists;
-11. UCS-15 connector-wide evidence is not automatically promoted into per-tool privileges;
-12. UCS-02 through UCS-15 regressions remain green.
+4. non-sandbox connectors cannot receive sandbox profiles;
+5. health checks and introspection remain zero-privilege;
+6. a tool execution selects only its own capability profile;
+7. managed gateway health is idempotent;
+8. every privileged execution gets a distinct Docker internal network;
+9. the broker container receives the configured alias on that network;
+10. the execution network is removed after the tool call;
+11. there is no fallback to Docker's ordinary bridge network;
+12. UCS-15 connector-wide evidence is not translated into tool privileges;
+13. UCS-02 through UCS-15 regressions remain green.
 
 ## Deferred
 
-- starting/stopping the credential-broker container itself;
-- multi-host gateway orchestration;
-- Kubernetes NetworkPolicy/service equivalents;
+- starting/stopping the broker container itself;
+- multi-host/Kubernetes gateway orchestration;
 - time-windowed tool profiles and scheduled revocation;
-- per-call ephemeral grants narrower than a capability profile;
-- policy-generated profiles from business intent;
+- per-call grants narrower than a capability profile;
 - managed gVisor/Kata/Firecracker backends;
 - gateway metrics and OpenTelemetry traces;
-- automated Agent Proxy migration from legacy Agent Vault deployments.
+- automated migration from legacy Agent Vault deployments to Agent Proxy.
