@@ -172,6 +172,22 @@ class DurableExecutor:
             providerAccountId=receipt.provider_account_id, bindingDigest=receipt.binding_digest,
             contractDigest=receipt.recovery_contract_digest, notAfter=receipt.provider_not_after)
 
+    def _store_provider_outcome(self, req, target, receipt, outcome):
+        if isinstance(outcome, ProviderOutcome):
+            outcome = ProviderOutcome.model_validate(outcome.model_dump())
+        key = self._provider_key(receipt)
+        if (not isinstance(outcome, ProviderOutcome) or any(getattr(outcome, name) != value
+                for name, value in key.model_dump().items())):
+            raise ReceiptError("RECOVERY_OUTCOME_MISMATCH")
+        if outcome.state in {"unknown", "not_found", "pending"}:
+            receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id,
+                receipt.version, "pending" if outcome.state == "pending" else "unknown")
+        else:
+            sealed = self.cipher.seal(receipt, outcome.result, target.result_retention_seconds)
+            receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id,
+                receipt.version, outcome.state, result_ciphertext=sealed)
+        return self._cached(req, receipt)
+
     async def _dispatch_result(self, req, ctx, registration, target, receipt, contract):
         # Independent commit MUST acknowledge before any provider IO. A lost
         # acknowledgement strands this attempt safely; never retry this write.
@@ -186,6 +202,8 @@ class DurableExecutor:
                 ctx.model_copy(deep=True), self._provider_key(receipt)) if contract else
                 registration.connector.execute(req.capability, req.model_copy(deep=True).input, ctx.model_copy(deep=True)))
         result = await self.provider_calls.run(call, timeout)
+        if contract and contract.dispatch_outcomes:
+            return self._store_provider_outcome(req, target, receipt, result)
         if not isinstance(result, ConnectorResult) or result.status != "success":
             receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id, receipt.version, "unknown")
             return self._error(req, "OUTCOME_UNKNOWN", receipt)
@@ -195,8 +213,10 @@ class DurableExecutor:
         return self._cached(req, receipt)
 
     async def _replay(self, req, ctx, registration, target, receipt):
+        if receipt.state == "pending":
+            return self._cached(req, receipt)  # Accepted jobs may only be looked up.
         contract = self._recovery_contract(target, registration)
-        if (contract.replay is None or not target.success_is_final):
+        if contract.replay is None or not (target.success_is_final or contract.dispatch_outcomes):
             raise ReceiptError("REPLAY_NOT_CONFIGURED")
         if (receipt.recovery_contract_digest != contract.digest() or
             (receipt.connector_id, receipt.connector_version) != (target.connector_id, target.connector_version)):
@@ -238,20 +258,7 @@ class DurableExecutor:
                 raise ReceiptError("RECOVERY_BUDGET_EXHAUSTED")
             outcome = await self.provider_calls.run(lambda: registration.connector.lookup_execution(
                 req.capability, ctx.model_copy(deep=True), key.model_copy(deep=True)), timeout)
-            if isinstance(outcome, ProviderOutcome):
-                # Revalidate even a model instance: adapter code could mutate it.
-                outcome = ProviderOutcome.model_validate(outcome.model_dump())
-            if (not isinstance(outcome, ProviderOutcome) or any(getattr(outcome, name) != value
-                    for name, value in key.model_dump().items())):
-                raise ReceiptError("RECOVERY_OUTCOME_MISMATCH")
-            if outcome.state in {"unknown", "not_found", "pending"}:
-                receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id,
-                    receipt.version, "pending" if outcome.state == "pending" else "unknown")
-            else:
-                sealed = self.cipher.seal(receipt, outcome.result, target.result_retention_seconds)
-                receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id,
-                    receipt.version, outcome.state, result_ciphertext=sealed)
-            return self._cached(req, receipt)
+            return self._store_provider_outcome(req, target, receipt, outcome)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -301,9 +308,9 @@ class DurableExecutor:
                 raise ReceiptError("EXECUTION_CONNECTOR_MISMATCH")
             if not ctx.approval_id:
                 raise ReceiptError("APPROVAL_REQUIRED")
-            if not target.success_is_final:
-                raise ReceiptError("EXECUTION_OUTCOME_CONTRACT_REQUIRED")
             contract = self._recovery_contract(target, registration) if target.recovery else None
+            if not (target.success_is_final or (contract and contract.dispatch_outcomes)):
+                raise ReceiptError("EXECUTION_OUTCOME_CONTRACT_REQUIRED")
             intent = ExecutionIntent(organizationId=req.actor.organization_id, operationId=req.operation_id,
                 requestId=req.request_id, userId=req.actor.user_id, agentId=req.actor.agent_id,
                 serviceId=target.service_id, providerAccountId=target.provider_account_id, capability=req.capability,

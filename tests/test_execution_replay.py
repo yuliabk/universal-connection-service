@@ -164,7 +164,7 @@ def test_replay_policy_requires_provider_expiry_and_concurrency_guarantees():
     with pytest.raises(ValidationError):
         ReplayPolicy(deduplicationWindowSeconds=300, maxAttempts=2,
             providerEnforcesNotAfter=False, concurrentDeduplication=True)
-    old = contract().model_dump(mode="json", by_alias=True, exclude={"replay"})
+    old = contract().model_dump(mode="json", by_alias=True, exclude={"replay", "dispatch_outcomes"})
     assert contract().digest() == hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

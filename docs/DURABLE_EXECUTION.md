@@ -187,3 +187,11 @@ auto-connect מחייב אותה הרשאת actor לפני dispatch או קרי�
 בדיקת הקריסה לאחר provider commit הורחבה להרצה מול שני backends: תהליך ילד מבצע את הפעולה הסינתטית ומסתיים ב־os._exit(42); מופע חדש מבצע lookup עם אותו provider key ומוודא השפעה יחידה. עבור PostgreSQL החיבור נלקח ממשתנה סביבת הבדיקה, ללא DSN בארגומנטים. witness SQLite נפרד משמש fixture סינתטי משותף לתהליכים; בדיקת witness PostgreSQL נפרד קיימת בנפרד. זו אינה הוכחה לפריסת witness מבוזרת או לעובד ישן שממשיך לפעול במקביל; האחרון עדיין בביקורת G4.
 
 סיווג effects אומת ב־commit `4b9c914` עם 290 בדיקות CI מוצלחות, PostgreSQL 16 ו־Docker: https://github.com/yuliabk/universal-connection-service/actions/runs/35130255269 . הרחבת בדיקת התהליך ל־PostgreSQL נוספה לאחר הרצה זו ודורשת CI משלה.
+
+### G3/G4 — קבלה אסינכרונית מפורשת מהספק
+
+RecoveryContract יכול כעת להצהיר `dispatchOutcomes=true`. ההצהרה משתתפת ב־digest המקובע, ולכן אינה משנה בדיעבד receipt שנוצרה בחוזה קודם. חוזים קיימים ללא הדגל שומרים את ה־digest הקודם. במצב זה execute_keyed חייב להחזיר ProviderOutcome עם providerKey/account/binding/contract/notAfter תואמים; גם מופע מודל נבדק מחדש כדי למנוע עקיפה באמצעות שינוי שדות לאחר יצירה. ConnectorResult רגיל אינו מספיק, אפילו אם status=success.
+
+תשובת pending נשמרת לפני החזרתה ללקוח, ללא תוצאת success וללא outbox סופי. retry רגיל מחזיר EXECUTION_PENDING; גם בקשת replay מפורשת אינה שולחת עבודה accepted שוב. הרשאת reconciliation מאפשרת לברר ולשמור תוצאה סופית. unknown/not_found אינם הוכחת אי־ביצוע. failed_no_effect מחייב כישלון סופי ו־lateExecutionPrevented=true. תשובה לא תואמת או כשל בשמירתה נשארים עמומים ואינם מאפשרים retry רגיל.
+
+target עם successIsFinal=false יכול לבצע רק כאשר חוזה dispatchOutcomes מאושר ומקובע מספק את הסמנטיקה המפורשת. successIsFinal=true ממשיך לתאר את חוזה ConnectorResult הקודם. בדיקות חדשות מכסות finality, mismatch ושינוי מודל, pending לאחר פתיחה מחדש, חסימת replay, השלמה באמצעות lookup, וקריסת תהליך אחרי commit של pending ולפני תשובת הלקוח. ספק הבדיקה שומר ledger עצמאי; בתהליך recovery מתקבלת השפעה אחת ואירוע outbox סופי אחד. בדיקות PostgreSQL נדרשות ב־CI; אין בכך אישור לחוזה ספק אמיתי.

@@ -27,6 +27,7 @@ class RecoveryContract(Model):
     max_lookups: int = Field(alias="maxLookups", ge=1, le=100)
     lookup_timeout_ms: int = Field(alias="lookupTimeoutMs", ge=1, le=60_000)
     replay: ReplayPolicy | None = None
+    dispatch_outcomes: bool = Field(alias="dispatchOutcomes", default=False)
 
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(self.model_dump(mode="json", by_alias=True, exclude_defaults=True),
@@ -63,6 +64,6 @@ class RecoveryConnector(Protocol):
     """Trusted adapter must implement the pinned provider semantics end to end."""
     def recovery_contract_digest(self) -> str: ...
     async def execute_keyed(self, capability: str, input: dict, ctx: ExecutionContext,
-                            key: ProviderExecutionKey) -> ConnectorResult: ...
+                            key: ProviderExecutionKey) -> ConnectorResult | ProviderOutcome: ...
     async def lookup_execution(self, capability: str, ctx: ExecutionContext,
                                key: ProviderExecutionKey) -> ProviderOutcome: ...
