@@ -50,8 +50,9 @@ def test_control_ports_and_registry_use_encrypted_documents_after_restart(contro
     assert len(rows) == 1 and rows[0].status == "validated"
     assert reopened.list_connectors(org + "-other") == []
     assert any(r.organization_id == org for r in reopened.list_connectors())
-    with store.repository.transaction() as conn:
-        assert store.repository.store._receipt_query(conn, "SELECT 1 FROM connector_state WHERE organization_id = ?", (org,)).fetchone() is None
+    # Read the physical backend's legacy table through its dialect-aware port.
+    # Receipt SQL translation deliberately does not address connector tables.
+    assert store.repository.store.list_connectors(org) == []
 
 
 def test_audit_and_evidence_filtering_preserve_tenant_and_request_boundaries(controls):
