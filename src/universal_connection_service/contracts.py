@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 Strategy = Literal["trusted_connector", "official_api", "oauth", "mcp", "generated_api_adapter", "browser"]
 Operation = Literal["read", "create", "update", "delete", "execute"]
 Status = Literal["success", "partial", "failed"]
+PolicyDecision = Literal["ALLOW", "DENY", "REQUIRE_APPROVAL"]
 Lifecycle = Literal["discovered", "generated", "sandboxed", "validated", "awaiting_approval", "trusted", "degraded", "repairing", "disabled", "rejected"]
 
 class Model(BaseModel):
@@ -21,6 +22,11 @@ class ServiceRef(Model):
     name: str = Field(min_length=1)
     base_url: str | None = Field(alias="baseUrl", default=None)
 
+class RiskHints(Model):
+    destructive: bool = False
+    financial: bool = False
+    permission_increase: bool = Field(alias="permissionIncrease", default=False)
+
 class ConnectionRequest(Model):
     request_id: str = Field(alias="requestId", min_length=1)
     actor: ActorRef
@@ -29,6 +35,7 @@ class ConnectionRequest(Model):
     operation: Operation
     input: dict[str, Any] = Field(default_factory=dict)
     read_only: bool = Field(alias="readOnly", default=True)
+    risk_hints: RiskHints = Field(alias="riskHints", default_factory=RiskHints)
 
 class AuthRequirement(Model):
     type: Literal["none", "api_key", "oauth2", "session", "certificate", "other"] = "none"
@@ -39,6 +46,7 @@ class RiskAssessment(Model):
     reasons: tuple[str, ...] = ()
     destructive: bool = False
     financial: bool = False
+    permission_increase: bool = Field(alias="permissionIncrease", default=False)
 
 class ConnectionPlan(Model):
     plan_id: str = Field(alias="planId")
@@ -52,6 +60,8 @@ class ConnectionPlan(Model):
     requires_build: bool = Field(alias="requiresBuild")
     requires_validation: bool = Field(alias="requiresValidation")
     requires_human_approval: bool = Field(alias="requiresHumanApproval")
+    policy_decision: PolicyDecision = Field(alias="policyDecision", default="ALLOW")
+    policy_reasons: tuple[str, ...] = Field(alias="policyReasons", default=())
 
 class ConnectorManifest(Model):
     connector_id: str = Field(alias="connectorId")
