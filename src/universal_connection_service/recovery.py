@@ -1,11 +1,21 @@
 """Operator-pinned provider recovery contract, independent of transport hints."""
 import hashlib
 import json
+from datetime import datetime
 from typing import Literal, Protocol
 
 from pydantic import Field, model_validator
 
 from .contracts import Model, ConnectorResult, ExecutionContext
+
+
+class ReplayPolicy(Model):
+    deduplication_window_seconds: int = Field(alias="deduplicationWindowSeconds", ge=1, le=31_536_000)
+    max_attempts: int = Field(alias="maxAttempts", ge=2, le=10)
+    # Reviewed provider guarantee: concurrent equal keys share one effect, and
+    # delayed requests past notAfter cannot create an effect after key eviction.
+    provider_enforces_not_after: Literal[True] = Field(alias="providerEnforcesNotAfter")
+    concurrent_deduplication: Literal[True] = Field(alias="concurrentDeduplication")
 
 
 class RecoveryContract(Model):
@@ -16,9 +26,10 @@ class RecoveryContract(Model):
     lookup_window_seconds: int = Field(alias="lookupWindowSeconds", ge=1, le=31_536_000)
     max_lookups: int = Field(alias="maxLookups", ge=1, le=100)
     lookup_timeout_ms: int = Field(alias="lookupTimeoutMs", ge=1, le=60_000)
+    replay: ReplayPolicy | None = None
 
     def digest(self) -> str:
-        return hashlib.sha256(json.dumps(self.model_dump(mode="json", by_alias=True),
+        return hashlib.sha256(json.dumps(self.model_dump(mode="json", by_alias=True, exclude_defaults=True),
             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -27,6 +38,7 @@ class ProviderExecutionKey(Model):
     provider_account_id: str = Field(alias="providerAccountId")
     binding_digest: str = Field(alias="bindingDigest")
     contract_digest: str = Field(alias="contractDigest")
+    not_after: datetime | None = Field(alias="notAfter", default=None)
 
 
 class ProviderOutcome(ProviderExecutionKey):

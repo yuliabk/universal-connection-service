@@ -124,3 +124,15 @@ digest החוזה נשמר בכוונה לפני dispatch. הקריאה הראש
 תוצאה סופית נשמרת עם ciphertext ו־audit outbox באותה טרנזקציה. lookup מאוחר אינו יכול לדרוס receipt שהושלמה על ידי עובד אחר. בדיקת subprocess חדשה מבצעת commit במסד ספק סינתטי נפרד ואז os._exit(42); הפעלה מחדש מבצעת lookup לפי המפתח המקורי, שומרת succeeded ומשאירה אפקט ספק יחיד. בדיקות נוספות מכסות budget לאורך restart, not_found/pending/unknown, mismatch בחשבון, actor לא מורשה, scope/tenant של ה־endpoint, פקיעת חלון וחסימת recovery רטרואקטיבי ל־G2.
 
 נותרו במסגרת G3/G4: replay עסקי תחת חוזה deduplication ובדיקות אישור, restore quarantine, כיסוי תחרות/late workers ו־timeouts עמידים לביטול, והוכחת סיווג effects מהימן לכל המתאמים. מסלול lookup הסינתטי אינו הוכחת חוזה לספק Production.
+
+### G3 — replay מוגן אצל הספק
+
+חוזה recovery יכול לכלול `replay` עם deduplicationWindowSeconds, maxAttempts (כולל הניסיון הראשון), providerEnforcesNotAfter=true ו־concurrentDeduplication=true. הפעלת replay מחייבת ראיות ספק מאושרות לשתי ההבטחות: אותה פעולה לא תבוצע פעמיים גם בבקשות מקבילות, ובקשה ישנה שמגיעה אחרי notAfter תידחה גם אחרי שהספק פינה את רשומת deduplication. ספק שנותן רק חלון שמירת מפתחות בלי אכיפת deadline מרוחקת אינו מתאים לחוזה זה. חוזי lookup ישנים ללא replay שומרים על אותו digest.
+
+השליחה הראשונה שומרת providerNotAfter באותה טרנזקציה עם dispatch. המועד הוא המוקדם מבין פקיעת האישור המקורי וסוף חלון deduplication, והוא נמסר למתאם עם המפתח. ניסיונות נוספים משתמשים בדיוק באותו מפתח, חשבון, binding, חוזה ו־notAfter; אין הארכת חלון, החלפת אישור או איפוס attempts. בדיקות מקומיות ו־timeout מוגבל מצמצמים שליחות מאוחרות, אך ההבטחה מול עובד שנעצר וחוזר תלויה גם באכיפה של הספק.
+
+`POST /v1/control-plane/executions/replay` דורש scope נפרד `executions:replay` לארגון ו־approvalId המקורי. אחרי בדיקות policy/actor/account מתבצעת טרנזקציה שבודקת receipt עמומה, CAS, digest, חלון ותקציב; היא נועלת את רשומת האישור מול revocation ומוודאת שהאישור המקורי consumed אך עדיין תקף ואינו revoked. האישור אינו נצרך מחדש. הטרנזקציה שומרת attempt חדש לפני IO. אובדן acknowledgement אינו גורם לקריאה לספק. receipt חסרה או prepared אינה נשלחת דרך endpoint זה, ותוצאה סופית מוחזרת מהאחסון.
+
+בדיקות SQLite/PostgreSQL משתמשות בספק סינתטי עם database נפרד ורשומת dedup אטומית: אחרי commit ותשובה שאבדה, replay מחזיר את האפקט המקורי, והמונה נשאר 1. נבדקים workers מקבילים, פתיחת אחסון מחדש, מפתח ו־deadline יציבים, אישור חסר/אחר/revoked/expired, budget שנצרך גם באובדן commit acknowledgement, scope נפרד ומניעת יצירת פעולה חדשה דרך replay. בדיקת בקשה מאוחרת מפנה במפורש את מטמון dedup של הספק ומוכיחה ש־notAfter עדיין מונע אפקט נוסף. אין בשינוי אימות של ספק Production אמיתי; הפעלת חוזה עבורו דורשת ראיות המותאמות למתאם ולגרסה.
+
+G3 עדיין פתוח עבור restore quarantine. G4 עדיין כולל cancellation, בדיקות תהליכים ועובדים ישנים נוספות, סיווג effects מהימן בכל המתאמים וביקורת מטריצת הדרישות.

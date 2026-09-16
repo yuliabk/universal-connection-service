@@ -166,7 +166,53 @@ class DurableExecutor:
     def _provider_key(receipt):
         return ProviderExecutionKey(providerKey=receipt.provider_key,
             providerAccountId=receipt.provider_account_id, bindingDigest=receipt.binding_digest,
-            contractDigest=receipt.recovery_contract_digest)
+            contractDigest=receipt.recovery_contract_digest, notAfter=receipt.provider_not_after)
+
+    async def _dispatch_result(self, req, ctx, registration, target, receipt, contract):
+        timeout = ctx.deadline_ms / 1000
+        if receipt.provider_not_after is not None:
+            timeout = min(timeout, (receipt.provider_not_after - utc_now()).total_seconds())
+        if timeout <= 0:
+            raise ReceiptError("REPLAY_BUDGET_EXHAUSTED")
+        call = (registration.connector.execute_keyed(req.capability, req.model_copy(deep=True).input,
+                ctx.model_copy(deep=True), self._provider_key(receipt)) if contract else
+                registration.connector.execute(req.capability, req.model_copy(deep=True).input, ctx.model_copy(deep=True)))
+        result = await asyncio.wait_for(call, timeout=timeout)
+        if not isinstance(result, ConnectorResult) or result.status != "success":
+            receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id, receipt.version, "unknown")
+            return self._error(req, "OUTCOME_UNKNOWN", receipt)
+        sealed = self.cipher.seal(receipt, result, target.result_retention_seconds)
+        receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id, receipt.version,
+                                              "succeeded", result_ciphertext=sealed)
+        return self._cached(req, receipt)
+
+    async def _replay(self, req, ctx, registration, target, receipt):
+        contract = self._recovery_contract(target, registration)
+        if (contract.replay is None or not target.success_is_final):
+            raise ReceiptError("REPLAY_NOT_CONFIGURED")
+        if (receipt.recovery_contract_digest != contract.digest() or
+            (receipt.connector_id, receipt.connector_version) != (target.connector_id, target.connector_version)):
+            raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
+        if not ctx.approval_id:
+            raise ReceiptError("APPROVAL_REQUIRED")
+        try:
+            receipt = self.store.begin_receipt_replay(receipt.organization_id, receipt.operation_id,
+                receipt.version, req.request_id, contract.digest(), contract.replay.max_attempts,
+                approval_ref_hash(ctx.approval_id))
+        except ReceiptError:
+            raise
+        except Exception:
+            # A lost replay-commit acknowledgement must not cause connector IO.
+            return self._error(req, "OUTCOME_UNKNOWN", receipt, unknown=True)
+        try:
+            return await self._dispatch_result(req, ctx, registration, target, receipt, contract)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            current = self.store.get_receipt(receipt.organization_id, receipt.operation_id)
+            if current and current.state in {"succeeded", "failed_no_effect"}:
+                return self._cached(req, current)
+            return self._error(req, "OUTCOME_UNKNOWN", current or receipt, unknown=True)
 
     async def _reconcile(self, req, ctx, registration, target, receipt):
         contract = self._recovery_contract(target, registration)
@@ -208,7 +254,7 @@ class DurableExecutor:
             return self._error(req, exc.code if isinstance(exc, ReceiptError) else "OUTCOME_UNKNOWN",
                 current or receipt)
 
-    async def execute(self, req, ctx, registration, *, allow_dispatch=True, reconcile=False):
+    async def execute(self, req, ctx, registration, *, allow_dispatch=True, reconcile=False, replay=False):
         receipt = None
         dispatched = False
         dispatch_started = False
@@ -233,10 +279,12 @@ class DurableExecutor:
                 if receipt.binding_digest != digest:
                     raise ReceiptError("IDEMPOTENCY_CONFLICT")
                 if receipt.state != "prepared":
+                    if replay and allow_dispatch and receipt.state not in {"succeeded", "failed_no_effect"}:
+                        return await self._replay(req, ctx, registration, target, receipt)
                     if reconcile and receipt.state not in {"succeeded", "failed_no_effect"}:
                         return await self._reconcile(req, ctx, registration, target, receipt)
                     return self._cached(req, receipt)
-            if not allow_dispatch or reconcile:
+            if not allow_dispatch or reconcile or replay:
                 return self._error(req, "RECEIPT_NOT_DISPATCHED", receipt)
             if (registration.manifest.connector_id, registration.manifest.version) != (target.connector_id, target.connector_version):
                 raise ReceiptError("EXECUTION_CONNECTOR_MISMATCH")
@@ -259,20 +307,11 @@ class DurableExecutor:
             dispatch_started = True
             receipt = self.store.begin_dispatch(receipt.organization_id, receipt.operation_id, receipt.version,
                                                 req.request_id, require_approval=True,
-                                                approval_ref_hash=approval_ref_hash(ctx.approval_id))
+                                                approval_ref_hash=approval_ref_hash(ctx.approval_id),
+                                                replay_window_seconds=contract.replay.deduplication_window_seconds
+                                                if contract and contract.replay else None)
             dispatched = True
-            # Context is copied so caller mutation cannot affect the dispatched request.
-            call = (registration.connector.execute_keyed(req.capability, req.model_copy(deep=True).input,
-                    ctx.model_copy(deep=True), self._provider_key(receipt)) if contract else
-                    registration.connector.execute(req.capability, req.model_copy(deep=True).input, ctx.model_copy(deep=True)))
-            result = await asyncio.wait_for(call, timeout=ctx.deadline_ms / 1000)
-            if not isinstance(result, ConnectorResult) or result.status != "success":
-                receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id, receipt.version, "unknown")
-                return self._error(req, "OUTCOME_UNKNOWN", receipt)
-            sealed = self.cipher.seal(receipt, result, target.result_retention_seconds)
-            receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id, receipt.version,
-                                                  "succeeded", result_ciphertext=sealed)
-            return self._cached(req, receipt)
+            return await self._dispatch_result(req, ctx, registration, target, receipt, contract)
         except asyncio.CancelledError:
             # The committed dispatch remains uncertain for a future caller.
             raise

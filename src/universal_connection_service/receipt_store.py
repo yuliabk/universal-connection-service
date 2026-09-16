@@ -6,7 +6,7 @@ Transaction ownership is supplied by the backend, never by a connector.
 from __future__ import annotations
 
 from typing import Literal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
 from .receipts import ExecutionIntent, ExecutionReceipt, ReceiptAudit, ReceiptError, utc_now
@@ -62,7 +62,7 @@ class SQLReceiptStore:
     def _receipt_time(self, value):
         return value.isoformat()
 
-    def _validate_execution_approval(self, conn, receipt):
+    def _validate_execution_approval(self, conn, receipt, *, allow_consumed=False):
         row = self._receipt_query(conn, "SELECT * FROM approval_grant WHERE approval_ref_hash = ?", (receipt.approval_ref_hash,)).fetchone()
         if not row:
             raise ReceiptError("APPROVAL_INVALID")
@@ -78,8 +78,9 @@ class SQLReceiptStore:
         fields = ("organization_id", "user_id", "agent_id", "service_id", "capability", "operation", "operation_id", "binding_digest")
         if any(row[name] != getattr(receipt, name) for name in fields):
             raise ReceiptError("APPROVAL_SCOPE_MISMATCH")
-        if row["consumed_at"] is not None:
+        if row["consumed_at"] is not None and not allow_consumed:
             raise ReceiptError("APPROVAL_ALREADY_USED")
+        return expires
 
     def revoke_execution_approval(self, organization_id: str, ref_hash: str) -> bool:
         with self._receipt_transaction() as conn:
@@ -132,11 +133,12 @@ class SQLReceiptStore:
         if cursor.rowcount != 1:
             raise ReceiptError("RECEIPT_STATE_CONFLICT")
 
-    def begin_dispatch(self, organization_id: str, operation_id: str, expected_version: int, request_id: str, *, require_approval: bool = False, approval_ref_hash: str | None = None) -> ExecutionReceipt:
+    def begin_dispatch(self, organization_id: str, operation_id: str, expected_version: int, request_id: str, *, require_approval: bool = False, approval_ref_hash: str | None = None, replay_window_seconds: int | None = None) -> ExecutionReceipt:
         if not request_id:
             raise ValueError("request_id is required")
         with self._receipt_transaction() as conn:
             receipt = self._expected(conn, organization_id, operation_id, expected_version, {"prepared"})
+            approval_expires = None
             if require_approval:
                 if approval_ref_hash is not None:
                     receipt.approval_ref_hash = approval_ref_hash
@@ -148,7 +150,14 @@ class SQLReceiptStore:
                     (timestamp, receipt.approval_ref_hash, organization_id, timestamp))
                 if consumed.rowcount != 1:
                     raise ReceiptError("APPROVAL_UNAVAILABLE")
+                approval_expires = self._validate_execution_approval(conn, receipt, allow_consumed=True)
             receipt.state = "dispatching"
+            if replay_window_seconds is not None:
+                if type(replay_window_seconds) is not int or replay_window_seconds <= 0:
+                    raise ValueError("replay window must be positive")
+                receipt.provider_not_after = utc_now() + timedelta(seconds=replay_window_seconds)
+                if approval_expires is not None:
+                    receipt.provider_not_after = min(receipt.provider_not_after, approval_expires)
             receipt.attempt_id = str(uuid4())
             receipt.attempt_count += 1
             self._save(conn, receipt, expected_version)
@@ -156,6 +165,36 @@ class SQLReceiptStore:
                 INSERT INTO execution_attempt (organization_id, operation_id, attempt_id, request_id, receipt_version, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """, (organization_id, operation_id, receipt.attempt_id, request_id, receipt.version, receipt.updated_at.isoformat()))
+            return receipt
+
+    def begin_receipt_replay(self, organization_id: str, operation_id: str, expected_version: int,
+                            request_id: str, contract_digest: str, max_attempts: int, approval_ref_hash: str) -> ExecutionReceipt:
+        with self._receipt_transaction() as conn:
+            receipt = self._expected(conn, organization_id, operation_id, expected_version, {"dispatching", "unknown", "pending"})
+            if not contract_digest or receipt.recovery_contract_digest != contract_digest:
+                raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
+            if not approval_ref_hash or receipt.approval_ref_hash != approval_ref_hash:
+                raise ReceiptError("APPROVAL_SCOPE_MISMATCH")
+            self._validate_execution_approval(conn, receipt, allow_consumed=True)
+            # Serialize authorization with concurrent revocation, without minting
+            # a second grant or altering its original consumption timestamp.
+            locked = self._receipt_query(conn, """UPDATE approval_grant SET consumed_at = consumed_at
+                WHERE approval_ref_hash = ? AND organization_id = ? AND consumed_at IS NOT NULL
+                AND revoked_at IS NULL""", (approval_ref_hash, organization_id)).rowcount
+            if locked != 1:
+                raise ReceiptError("APPROVAL_UNAVAILABLE")
+            self._validate_execution_approval(conn, receipt, allow_consumed=True)
+            if (receipt.provider_not_after is None or utc_now() >= receipt.provider_not_after
+                or receipt.attempt_count >= max_attempts):
+                raise ReceiptError("REPLAY_BUDGET_EXHAUSTED")
+            receipt.state = "dispatching"
+            receipt.attempt_count += 1
+            receipt.attempt_id = str(uuid4())
+            self._save(conn, receipt, expected_version)
+            self._receipt_query(conn, """INSERT INTO execution_attempt
+                (organization_id, operation_id, attempt_id, request_id, receipt_version, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""", (organization_id, operation_id, receipt.attempt_id,
+                    request_id, receipt.version, receipt.updated_at.isoformat()))
             return receipt
 
     def mark_unresolved(self, organization_id: str, operation_id: str, expected_version: int, state: Literal["unknown", "pending"]) -> ExecutionReceipt:
@@ -192,7 +231,7 @@ class SQLReceiptStore:
             raise ValueError("not a terminal state")
         with self._receipt_transaction() as conn:
             receipt = self._expected(conn, organization_id, operation_id, expected_version, {"dispatching", "unknown", "pending"})
-            decision = "execution_completed" if receipt.state == "dispatching" else "reconciled"
+            decision = "execution_completed" if receipt.state == "dispatching" and receipt.attempt_count == 1 else "reconciled"
             receipt.state = state
             receipt.result_ref = result_ref
             receipt.provider_reference = provider_reference

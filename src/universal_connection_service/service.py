@@ -145,7 +145,7 @@ class ConnectionService:
             approval_id=approval_id,
         )
 
-    async def execute(self, req: ConnectionRequest, ctx: ExecutionContext, *, allow_dispatch: bool = True, reconcile: bool = False) -> ConnectionResult:
+    async def execute(self, req: ConnectionRequest, ctx: ExecutionContext, *, allow_dispatch: bool = True, reconcile: bool = False, replay: bool = False) -> ConnectionResult:
         req, ctx = req.model_copy(deep=True), ctx.model_copy(deep=True)
         service_id = self.compiler.service_id(req)
         if not self._context_matches(req, ctx):
@@ -197,9 +197,9 @@ class ConnectionService:
             item = self.registry.trusted(plan.service_id, req.capability, req.actor.organization_id)
             if item is None or item.manifest.connector_id != plan.connector_id:
                 return self._failed(req, plan.service_id, "CONNECTION_UNAVAILABLE", "Connector is no longer available")
-            return await self.durable_executor.execute(req, ctx, item, allow_dispatch=allow_dispatch, reconcile=reconcile)
+            return await self.durable_executor.execute(req, ctx, item, allow_dispatch=allow_dispatch, reconcile=reconcile, replay=replay)
 
-        if not allow_dispatch or reconcile:
+        if not allow_dispatch or reconcile or replay:
             return self._failed(req, plan.service_id, "RECEIPT_NOT_DISPATCHED", "No durable execution to resume")
 
         if plan.policy_decision == "REQUIRE_APPROVAL":
