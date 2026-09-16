@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import Field, SecretStr, field_validator
-from .receipt_store import SQLReceiptStore, receipt_schema
+from .receipt_store import SQLReceiptStore, receipt_schema, receipt_result_schema
 
 from .approvals import ApprovalRecord, ApprovalStore
 from .contracts import ConnectorManifest, Lifecycle, Model
@@ -172,6 +172,13 @@ _MIGRATIONS += (
     Migration(4, "durable_execution_receipts", receipt_schema("ucs_internal.") + (
         "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
     )),
+    Migration(5, "execution_approval_binding_and_encrypted_results", (
+        "ALTER TABLE ucs_internal.approval_grant ADD COLUMN operation_id TEXT",
+        "ALTER TABLE ucs_internal.approval_grant ADD COLUMN binding_digest TEXT",
+        "ALTER TABLE ucs_internal.approval_grant ADD COLUMN revoked_at TIMESTAMPTZ",
+        receipt_result_schema("ucs_internal."),
+        "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
+    )),
 )
 
 LATEST_SCHEMA_VERSION = _MIGRATIONS[-1].version
@@ -247,13 +254,17 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
         return True
 
     def _receipt_sql(self, sql: str) -> str:
-        for table in ("execution_receipt", "execution_attempt", "execution_outbox"):
+        for table in ("execution_receipt", "execution_attempt", "execution_outbox", "execution_result", "approval_grant"):
             sql = sql.replace(table, "ucs_internal." + table)
         return sql.replace("?", "%s")
+
+    def _receipt_time(self, value):
+        return value
 
     @contextmanager
     def _receipt_transaction(self):
         with self._pool.connection() as conn, conn.transaction():
+            conn.execute("SET LOCAL synchronous_commit = on")
             yield conn
 
     def _migration_versions(self) -> set[int]:
@@ -521,8 +532,8 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
                 INSERT INTO ucs_internal.approval_grant (
                     approval_ref_hash, request_id, organization_id, user_id,
                     agent_id, service_id, capability, operation, expires_at,
-                    consumed_at, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    consumed_at, created_at, operation_id, binding_digest, revoked_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (approval_ref_hash) DO NOTHING
                 """,
                 (
@@ -537,6 +548,9 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
                     record.expires_at,
                     record.consumed_at,
                     record.created_at,
+                    record.operation_id,
+                    record.binding_digest,
+                    record.revoked_at,
                 ),
             )
 
@@ -560,6 +574,9 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
             expiresAt=self._dt(row["expires_at"]),
             consumedAt=self._dt(row["consumed_at"]),
             createdAt=self._dt(row["created_at"]),
+            operationId=row["operation_id"],
+            bindingDigest=row["binding_digest"],
+            revokedAt=row["revoked_at"],
         )
 
     def consume_approval(self, approval_ref_hash: str, consumed_at: datetime) -> bool:
@@ -570,6 +587,7 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
                 SET consumed_at = %s
                 WHERE approval_ref_hash = %s
                   AND consumed_at IS NULL
+                  AND revoked_at IS NULL
                   AND expires_at > %s
                 """,
                 (consumed_at, approval_ref_hash, consumed_at),

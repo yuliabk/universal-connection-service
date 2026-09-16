@@ -6,6 +6,7 @@ Transaction ownership is supplied by the backend, never by a connector.
 from __future__ import annotations
 
 from typing import Literal
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .receipts import ExecutionIntent, ExecutionReceipt, ReceiptAudit, ReceiptError, utc_now
@@ -58,6 +59,34 @@ class SQLReceiptStore:
     def _receipt_query(self, conn, sql, args=()):
         return conn.execute(self._receipt_sql(sql), args)
 
+    def _receipt_time(self, value):
+        return value.isoformat()
+
+    def _validate_execution_approval(self, conn, receipt):
+        row = self._receipt_query(conn, "SELECT * FROM approval_grant WHERE approval_ref_hash = ?", (receipt.approval_ref_hash,)).fetchone()
+        if not row:
+            raise ReceiptError("APPROVAL_INVALID")
+        if row["revoked_at"] is not None:
+            raise ReceiptError("APPROVAL_REVOKED")
+        expires = row["expires_at"]
+        if isinstance(expires, str):
+            expires = datetime.fromisoformat(expires)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= utc_now():
+            raise ReceiptError("APPROVAL_EXPIRED")
+        fields = ("organization_id", "user_id", "agent_id", "service_id", "capability", "operation", "operation_id", "binding_digest")
+        if any(row[name] != getattr(receipt, name) for name in fields):
+            raise ReceiptError("APPROVAL_SCOPE_MISMATCH")
+        if row["consumed_at"] is not None:
+            raise ReceiptError("APPROVAL_ALREADY_USED")
+
+    def revoke_execution_approval(self, organization_id: str, ref_hash: str) -> bool:
+        with self._receipt_transaction() as conn:
+            return self._receipt_query(conn, """UPDATE approval_grant SET revoked_at = ?
+                WHERE organization_id = ? AND approval_ref_hash = ? AND revoked_at IS NULL""",
+                (self._receipt_time(utc_now()), organization_id, ref_hash)).rowcount == 1
+
     def _load_receipt(self, conn, organization_id: str, operation_id: str) -> ExecutionReceipt | None:
         row = self._receipt_query(conn,
             "SELECT receipt_json FROM execution_receipt WHERE organization_id = ? AND operation_id = ?",
@@ -103,11 +132,22 @@ class SQLReceiptStore:
         if cursor.rowcount != 1:
             raise ReceiptError("RECEIPT_STATE_CONFLICT")
 
-    def begin_dispatch(self, organization_id: str, operation_id: str, expected_version: int, request_id: str) -> ExecutionReceipt:
+    def begin_dispatch(self, organization_id: str, operation_id: str, expected_version: int, request_id: str, *, require_approval: bool = False, approval_ref_hash: str | None = None) -> ExecutionReceipt:
         if not request_id:
             raise ValueError("request_id is required")
         with self._receipt_transaction() as conn:
             receipt = self._expected(conn, organization_id, operation_id, expected_version, {"prepared"})
+            if require_approval:
+                if approval_ref_hash is not None:
+                    receipt.approval_ref_hash = approval_ref_hash
+                self._validate_execution_approval(conn, receipt)
+                timestamp = self._receipt_time(utc_now())
+                consumed = self._receipt_query(conn, """UPDATE approval_grant SET consumed_at = ?
+                    WHERE approval_ref_hash = ? AND organization_id = ? AND consumed_at IS NULL
+                    AND revoked_at IS NULL AND expires_at > ?""",
+                    (timestamp, receipt.approval_ref_hash, organization_id, timestamp))
+                if consumed.rowcount != 1:
+                    raise ReceiptError("APPROVAL_UNAVAILABLE")
             receipt.state = "dispatching"
             receipt.attempt_id = str(uuid4())
             receipt.attempt_count += 1
@@ -127,7 +167,7 @@ class SQLReceiptStore:
             self._save(conn, receipt, expected_version)
             return receipt
 
-    def complete_receipt(self, organization_id: str, operation_id: str, expected_version: int, state: Literal["succeeded", "failed_no_effect"], *, result_ref: str | None = None, provider_reference: str | None = None) -> ExecutionReceipt:
+    def complete_receipt(self, organization_id: str, operation_id: str, expected_version: int, state: Literal["succeeded", "failed_no_effect"], *, result_ref: str | None = None, provider_reference: str | None = None, result_ciphertext: str | None = None) -> ExecutionReceipt:
         """Called only with authoritative outcome evidence by the trusted coordinator.
 
         References are opaque handles, never payloads. Unknown must not be classified
@@ -151,12 +191,22 @@ class SQLReceiptStore:
             )
             receipt.audit_id = event.event_id
             self._save(conn, receipt, expected_version)
+            if result_ciphertext is not None:
+                if len(result_ciphertext) > 2_000_000:
+                    raise ReceiptError("RESULT_TOO_LARGE")
+                self._receipt_query(conn, """INSERT INTO execution_result (organization_id, operation_id, ciphertext)
+                    VALUES (?, ?, ?)""", (organization_id, operation_id, result_ciphertext))
             self._receipt_query(conn, """
                 INSERT INTO execution_outbox (organization_id, event_id, operation_id, event_json)
                 VALUES (?, ?, ?, ?)
                 """, (organization_id, event.event_id, operation_id, event.model_dump_json()))
             return receipt
 
+    def get_receipt_result(self, organization_id: str, operation_id: str) -> str | None:
+        with self._receipt_transaction() as conn:
+            row = self._receipt_query(conn, """SELECT ciphertext FROM execution_result
+                WHERE organization_id = ? AND operation_id = ?""", (organization_id, operation_id)).fetchone()
+            return row["ciphertext"] if row else None
     def pending_receipt_audit(self, organization_id: str, limit: int = 100) -> list[ReceiptAudit]:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
@@ -173,3 +223,14 @@ class SQLReceiptStore:
                 UPDATE execution_outbox SET delivered = 1 WHERE organization_id = ? AND event_id = ?
                 """, (organization_id, event_id))
             return cursor.rowcount == 1
+
+
+def receipt_result_schema(prefix: str = "") -> str:
+    return f"""CREATE TABLE IF NOT EXISTS {prefix}execution_result (
+        organization_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        ciphertext TEXT NOT NULL,
+        PRIMARY KEY (organization_id, operation_id),
+        FOREIGN KEY (organization_id, operation_id)
+            REFERENCES {prefix}execution_receipt (organization_id, operation_id)
+    )"""

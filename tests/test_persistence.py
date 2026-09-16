@@ -248,7 +248,8 @@ def test_approval_evidence_and_audit_store_only_hashed_reference():
             context(request_id="r-write", approval_id=raw_approval_id),
         )
     )
-    assert result.status == "success"
+    assert result.status == "failed"
+    assert result.error.code == "DURABLE_EXECUTION_REQUIRED"
 
     approval_evidence = store.list_evidence(
         "org-1",
@@ -256,7 +257,7 @@ def test_approval_evidence_and_audit_store_only_hashed_reference():
         kind="approval_verification",
     )
     assert len(approval_evidence) == 1
-    assert approval_evidence[0].payload["valid"] is True
+    assert approval_evidence[0].payload["valid"] is False
     assert approval_evidence[0].payload["approvalRefHash"]
 
     audit = store.list_audit("org-1", request_id="r-write")

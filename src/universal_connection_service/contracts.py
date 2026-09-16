@@ -29,6 +29,7 @@ class RiskHints(Model):
 
 class ConnectionRequest(Model):
     request_id: str = Field(alias="requestId", min_length=1)
+    operation_id: str | None = Field(alias="operationId", default=None, min_length=1, max_length=200)
     actor: ActorRef
     service: ServiceRef
     capability: str = Field(min_length=1)
@@ -125,6 +126,8 @@ class ConnectionResult(Model):
     data: Any | None = None
     error: ConnectionError | None = None
     audit_id: str = Field(alias="auditId")
+    receipt_id: str | None = Field(alias="receiptId", default=None)
+    execution_state: Literal["prepared", "dispatching", "pending", "unknown", "succeeded", "failed_no_effect"] | None = Field(alias="executionState", default=None)
 
 @runtime_checkable
 class ConnectorContract(Protocol):

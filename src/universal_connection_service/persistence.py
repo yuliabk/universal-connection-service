@@ -9,7 +9,7 @@ from threading import RLock
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
-from .receipt_store import SQLReceiptStore, receipt_schema
+from .receipt_store import SQLReceiptStore, receipt_schema, receipt_result_schema
 from .receipts import ReceiptStore
 
 from .contracts import (
@@ -34,6 +34,7 @@ WorkflowStage = Literal[
     "awaiting_promotion",
     "awaiting_execution_approval",
     "ready_to_execute",
+    "awaiting_reconciliation",
     "completed",
     "failed",
 ]
@@ -188,10 +189,17 @@ class SQLiteStateStore(SQLReceiptStore):
             self._connection.execute("PRAGMA foreign_keys = ON")
             if self.path != ":memory:":
                 self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA synchronous = FULL")
             self._create_schema()
             with self._connection:
+                self._connection.execute("BEGIN IMMEDIATE")
                 for statement in receipt_schema():
                     self._connection.execute(statement)
+                self._connection.execute(receipt_result_schema())
+                columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(approval_grant)")}
+                for column in ("operation_id", "binding_digest", "revoked_at"):
+                    if column not in columns:
+                        self._connection.execute(f"ALTER TABLE approval_grant ADD COLUMN {column} TEXT")
 
     @property
     def receipts_durable(self) -> bool:
@@ -538,8 +546,8 @@ class SQLiteStateStore(SQLReceiptStore):
                 INSERT INTO approval_grant (
                     approval_ref_hash, request_id, organization_id, user_id,
                     agent_id, service_id, capability, operation, expires_at,
-                    consumed_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    consumed_at, created_at, operation_id, binding_digest, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (approval_ref_hash) DO NOTHING
                 """,
                 (
@@ -554,6 +562,9 @@ class SQLiteStateStore(SQLReceiptStore):
                     record.expires_at.isoformat(),
                     record.consumed_at.isoformat() if record.consumed_at else None,
                     record.created_at.isoformat(),
+                    record.operation_id,
+                    record.binding_digest,
+                    record.revoked_at.isoformat() if record.revoked_at else None,
                 ),
             )
 
@@ -579,6 +590,9 @@ class SQLiteStateStore(SQLReceiptStore):
             expiresAt=datetime.fromisoformat(row["expires_at"]),
             consumedAt=datetime.fromisoformat(row["consumed_at"]) if row["consumed_at"] else None,
             createdAt=datetime.fromisoformat(row["created_at"]),
+            operationId=row["operation_id"],
+            bindingDigest=row["binding_digest"],
+            revokedAt=row["revoked_at"],
         )
 
     def consume_approval(self, approval_ref_hash: str, consumed_at: datetime) -> bool:
@@ -590,6 +604,7 @@ class SQLiteStateStore(SQLReceiptStore):
                 SET consumed_at = ?
                 WHERE approval_ref_hash = ?
                   AND consumed_at IS NULL
+                  AND revoked_at IS NULL
                   AND expires_at > ?
                 """,
                 (timestamp, approval_ref_hash, timestamp),

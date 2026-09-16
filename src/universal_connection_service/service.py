@@ -9,6 +9,7 @@ from .discovery import DiscoveryEngine
 from .persistence import AuditEvent, AuditStore, EvidenceRecord, EvidenceStore
 from .policy import ApprovalVerifier, PolicyEngine
 from .registry import ConnectorRegistry
+from .execution import DurableExecutor
 
 
 class ConnectionService:
@@ -21,6 +22,7 @@ class ConnectionService:
         audit_store: AuditStore | None = None,
         evidence_store: EvidenceStore | None = None,
         discovery_engine: DiscoveryEngine | None = None,
+        durable_executor: DurableExecutor | None = None,
     ):
         self.registry = registry
         self.compiler = ConnectionCompiler(
@@ -32,6 +34,7 @@ class ConnectionService:
         self.approval_verifier = approval_verifier
         self.audit_store = audit_store
         self.evidence_store = evidence_store
+        self.durable_executor = durable_executor
 
     @staticmethod
     def _context_matches(req: ConnectionRequest, ctx: ExecutionContext) -> bool:
@@ -143,6 +146,7 @@ class ConnectionService:
         )
 
     async def execute(self, req: ConnectionRequest, ctx: ExecutionContext) -> ConnectionResult:
+        req, ctx = req.model_copy(deep=True), ctx.model_copy(deep=True)
         service_id = self.compiler.service_id(req)
         if not self._context_matches(req, ctx):
             return self._failed(
@@ -177,6 +181,23 @@ class ConnectionService:
                 policy_decision=plan.policy_decision,
                 approval_id=ctx.approval_id,
             )
+
+        side_effecting = (req.operation != "read" or not req.read_only or plan.risk.destructive
+                          or plan.risk.financial or plan.risk.permission_increase
+                          or req.risk_hints.destructive or req.risk_hints.financial or req.risk_hints.permission_increase
+                          or (self.durable_executor is not None and self.durable_executor.protects(req)))
+        if side_effecting:
+            if self.durable_executor is None:
+                self._persist_approval_evidence(req, connector_id=plan.connector_id, approval_id=ctx.approval_id,
+                    valid=False, code="DURABLE_EXECUTION_REQUIRED")
+                return self._failed(req, plan.service_id,
+                    "APPROVAL_REQUIRED" if not ctx.approval_id else "DURABLE_EXECUTION_REQUIRED",
+                    "Side-effecting execution requires durable receipts and a bound approval", user_action=True,
+                    connector_id=plan.connector_id, policy_decision=plan.policy_decision, approval_id=ctx.approval_id)
+            item = self.registry.trusted(plan.service_id, req.capability, req.actor.organization_id)
+            if item is None or item.manifest.connector_id != plan.connector_id:
+                return self._failed(req, plan.service_id, "CONNECTION_UNAVAILABLE", "Connector is no longer available")
+            return await self.durable_executor.execute(req, ctx, item)
 
         if plan.policy_decision == "REQUIRE_APPROVAL":
             if not ctx.approval_id:

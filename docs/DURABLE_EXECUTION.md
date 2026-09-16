@@ -42,12 +42,32 @@ ConnectionService יבדוק receipt לפני צריכת אישור שכבר ש�
 
 בדיקות `tests/test_receipts.py` מכסות מפתח יציב בפתיחה מחדש, binding conflicts, תחרות CAS בין שני מופעי backend, חסימת dispatch חוזר מ־unknown, completion/outbox אטומיים, tenant isolation, acknowledgement חוזר, rollback בכשל outbox ואובדן acknowledgement של commit. בדיקת SQLite בתהליך נפרד משתמשת ב־os._exit לאחר dispatch commit ומוודאת שלא ניתן לבצע dispatch חדש. בדיקות PostgreSQL רצות מול שרת אמיתי ב־CI. בדיקת workflow ישנה עודכנה כדי לא לקבע את גרסת הסכימה ל־3 לאחר הוספת migration 4.
 
-עדיין אין חיבור ל־ConnectionService או הגנה פעילה על פעולות עסקיות. בדיקת התהליך ב־G1 מוכיחה עמידות dispatch בלבד; היא אינה מוכיחה התאוששות לאחר השפעת ספק, שתיבדק ב־G4. אין עדיין consumer ל־outbox, result encryption, קשירת approval ל־operation, retries מוגני ספק, retention או recovery workflow. אין טענת השלמת UCS-19.
+בנקודת G1 עדיין לא היה חיבור ל־ConnectionService. בדיקת התהליך ב־G1 מוכיחה עמידות dispatch בלבד; היא אינה מוכיחה התאוששות לאחר השפעת ספק. יתר היכולות מתוארות לפי קבוצת המימוש שלהן להלן. אין טענת השלמת UCS-19.
 
 ## סדר G2 הבא
+
+החלטת G2: consume של אישור יבוצע באותה טרנזקציה עם המעבר prepared -> dispatching ויצירת attempt, אחרי שהכוונה נשמרה. rollback משאיר אישור לא־צרוך; אובדן acknowledgement אחרי commit משאיר receipt חסומה ב־dispatching. השלמת result מוצפן ו־outbox תהיה אטומית. grants קיימים ללא operation/digest binding לא יורשו לכתיבה, אך יישארו תקפים למסלולי read/promotion הקיימים לפי המדיניות שלהם. הגדרות target מהימנות יקשרו organization/service/capability/connector version לחשבון ספק ול־credential handles מאושרים; החלפת handle לא תחליף זהות פעולה. success ייחשב סופי רק אם חוזה target מאושר מצהיר על כך. פלט partial/failed ללא הוכחה סופית ישאיר unknown. G3 יוסיף reconciliation/replay מבוקר במקום retry רגיל.
 
 1. הרחבת ConnectionRequest ב־operationId ו־ConnectionResult ב־receiptId/executionState.
 2. operation/digest binding של approvals ומעבר מתועד מ־grants ישנים; צריכה אטומית עם receipt ב־SQLite/PostgreSQL. אישור של פעולה אחרת לא יוכל לשמש לפעולה עמומה.
 3. coordinator מהימן שיבדוק policy ו־actor לפני גישה לתוצאה, ויחייב durable store לכל פעולה בעלת השפעה. cached success לא יצרוך approval שוב; unknown לא יבצע connector.execute רגיל.
 4. result storage מוצפן, completion אטומי, ומבחני כשל לפני/אחרי IO. memory mode ו־backend חסר לא יוכלו להפעיל write דרך מסלול legacy.
 5. בדיקות והרצת רגרסיה לפני G3; לשמור את PR #19 כטיוטה עד סגירת כל הקבוצות.
+
+## ממשק G2 ומעבר מהגרסה הקודמת
+
+ConnectionService מפנה פעולות שאינן read, readOnly=false, סיכון destructive/financial/permissionIncrease, או capability הרשומה בקטלוג execution targets, ל־DurableExecutor. אין bypass לכתיבה דרך ALLOW של policy או אישור ישן בזיכרון. פעולות read שלא רשומות בקטלוג עדיין נשענות על חוזה הסיווג של הפלטפורמה הקוראת; לפני Production יש להוכיח שכל capability בעלת השפעה מסווגת במטא־נתונים מהימנים גם אם הקורא טוען read. בדיקת G2 מוכיחה חסימת שינוי כזה עבור capability רשומה. כיסוי סיווג מלא למתאמים ופריסה נשאר חלק מביקורת G4.
+
+לכתיבה נדרש operationId; requestId יכול להשתנות בין ניסיונות. issuer מחייב אישור עם organization/user/agent/service/capability/operation, operationId ו־bindingDigest. `auto-connect` מנפיק binding דרך ה־executor המהימן. אישור consumed אינו מספיק לביצוע נוסף; receipt קיימת מכריעה אם אפשר להחזיר תוצאה. אישור revoked/expired אינו יכול להתחיל dispatch. אפשר להחליף אישור עבור prepared בלבד אחרי בירור binding; אין החלפת אישור שהופכת unknown לפעולה חדשה.
+
+הגדרות host החדשות (אין ערכים אמיתיים או פריסה בשינוי):
+- `UCS_EXECUTION_TARGETS_JSON`: מערך ExecutionTarget עם organizationId, serviceId, capability, providerAccountId, connectorId, connectorVersion, operations, userIds, agentIds, credentialHandleHashes, allowNoCredentials, successIsFinal ו־resultRetentionSeconds. אין wildcard tenant. hash של handle חייב להיות תואם לחשבון הספק שהמפעיל הגדיר; rotation מוסיפה hash של handle חדש לאותו חשבון. allowNoCredentials תקף רק למחבר auth=none.
+- `UCS_RECEIPT_KEYRING_JSON`: אובייקט עם activeKey ו־keys (מיפוי key ID לחומר מפתח base64 של 32 bytes). החומר נמסר למארח דרך מנגנון סודות; אינו נשמר בקוד, ב־receipts או ב־audit. תצורה חלקית, key באורך שגוי או store לא עמיד גורמים לכשל startup. בלי הגדרות אלה read ממשיך לפי המדיניות, אך write חסום.
+
+התוצאה נשמרת ב־execution_result כשהיא מוצפנת ב־AES-256-GCM, עם key נגזר לכל organization ו־AAD שקושר receipt/operation/binding. ניתן להשאיר מפתח קודם ב־keyring לקריאת receipts ישנות. אובדן מפתח או expiry מחזירים RESULT_UNAVAILABLE/RESULT_EXPIRED ואינם משחררים operationId לשימוש חוזר. מחיקה פיזית ו־restore quarantine עדיין שייכים ל־G3. אין plaintext body ב־receipt או outbox.
+
+Migration 5 מוסיף operation/digest/revocation ל־approval_grant וטבלת תוצאות מוצפנות. SQLite מבצע הרחבה additive תחת BEGIN IMMEDIATE עם synchronous=FULL; PostgreSQL משתמש במנגנון migrations הקיים וב־synchronous_commit=on לטרנזקציות receipt. זה מבטיח גבול commit מקומי, לא שרידות אובדן דיסק או restore חסר.
+
+successIsFinal הוא חוזה מפעיל מאושר, לא רמז מהמודל או MCP annotation. ללא חוזה זה dispatch חסום. תוצאה שאינה success או exception אחרי dispatch נשארת unknown; אין retries אוטומטיים ב־G2. Timeout/cancellation אינם הוכחת אי־ביצוע. outcome עמום ב־auto-connect נכנס ל־awaiting_reconciliation עם nextAction=reconcile_execution, ואינו מציע restart. מימוש בירור בפועל יתווסף ב־G3.
+
+auditId סופי מצביע לאירוע outbox; לפני completion, receiptId משמש גם כאסמכתת הכוונה העמידה בשדה auditId. כשל לפני הכנת receipt אינו ראיית ביצוע. G3 ישלים מסירת outbox ל־audit store ונתיב status/reconciliation מורשה.

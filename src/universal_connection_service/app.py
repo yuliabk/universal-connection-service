@@ -56,6 +56,7 @@ from .sandbox_policy_compiler import (
 )
 from .sandbox_tool_policy import SandboxToolPolicyService, build_sandbox_tool_policy_router
 from .service import ConnectionService
+from .execution import executor_from_env
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -286,6 +287,7 @@ service = ConnectionService(
     audit_store=state_store,
     evidence_store=state_store,
     discovery_engine=discovery_engine,
+    durable_executor=executor_from_env(state_store),
 )
 mcp_validation_service = MCPValidationService(
     registry,
