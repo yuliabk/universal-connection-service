@@ -205,3 +205,17 @@ RecoveryContract מגדיר recoveryBackoffMs ו־clockMarginMs חיוביים, 
 replay נחסם כאשר now + clockMarginMs מגיע ל־providerNotAfter; גם זמן ההמתנה לקריאת הספק מוגבל לאותו מרווח בטוח. מפתח הספק ו־notAfter המקוריים אינם משתנים. הספק עדיין חייב לאכוף notAfter בעצמו, כולל בקשה ישנה שמתעכבת אחרי הבדיקה המקומית. מרווח זה מניח סטיית שעון בתוך הגבול שהמפעיל אישר; הוא אינו הוכחה לסנכרון שעונים בפריסה. שעון שחזר לאחור מאריך backoff שמור במקום לשחררו מוקדם. אין שינוי בזהות הפעולה או הרשאת replay כתוצאה מפקיעת ההמתנה.
 
 בדיקות test_recovery_timing.py מכסות פתיחה מחדש, חסימה משותפת לשני מסלולי התאוששות, אי־צריכת תקציב בניסיון מוקדם, גבול מדויק של זמן מותר, אובדן acknowledgement ומרווח לפני expiry. בדיקות שני backends נדרשות ב־CI.
+
+### G3 — התראות עמידות ומדדי ביצוע למפעיל מורשה
+
+נוספה טבלת execution_notice, עם migration 6 ב־PostgreSQL והרחבה additive ב־SQLite. לפני הפעלת runtime מול PostgreSQL קיים יש להריץ את מנגנון migrate הקיים עם הרשאת בעל הסכימה; בדיקת readiness מזהה גרסת סכימה ישנה. אין ל־runtime צורך בהרשאת יצירת טבלאות לצורך דיווח שוטף.
+
+ה־executor שומר התראה ממוזערת בקודים מוגדרים מראש עבור unknown/pending, conflict, חסימת replay/recovery ומיצוי תקציב. לכל organization/receipt/code נשמר notice_id יציב, first_seen, last_seen ומספר observations. retry של אותה התראה אינו יוצר התראה לוגית חדשה. המספר הוא מספר תצפיות, לא מספר השפעות או ניסיונות ספק; אובדן acknowledgement של כתיבת התראה יכול להוסיף תצפית חוזרת. אין גופי בקשות/תשובות, approval IDs, credential handles או הודעות שגיאה גולמיות ברשומה. היסטוריית ההתראות נשארת גם אחרי פתרון receipt; מצב receipt נוכחי מוצג במדדים בנפרד.
+
+ממשקי read חדשים תחת `/v1/control-plane/executions`:
+- `GET /notices?organizationId=...&limit=100&after=...`: רשומות ארגוניות עם cursor של notice_id; הגודל מוגבל ל־100. בסריקה מחזורית יש להתחיל שוב ללא cursor כדי לקלוט רשומות חדשות ועדכונים; UUID אינו רצף זמן או stream cursor.
+- `GET /metrics?organizationId=...`: receiptStates, unknownReceipts (כולל dispatching שנותר עמום), outboxBacklog, oldestUnresolvedAgeSeconds ו־noticeObservations לפי קוד. אלה מדדי snapshot ותצפיות היסטוריות, ללא מזהי ארגונים/פעולות בתוויות התוצאה; אין endpoint ציבורי לכל הארגונים.
+
+שני הממשקים דורשים bearer עם scope נפרד `executions:observe` והרשאה לארגון. connections:execute ו־connectors:review אינם מקנים הרשאת צפייה בהתראות. הרשאה זו אינה מאפשרת replay או שינוי receipt. כשל אחסון בקריאה מחזיר שגיאה גנרית ללא פרטי מסד. כשל שמירת התראה מחזיר EXECUTION_NOTICE_STORE_UNAVAILABLE עם executionState העמום, ואינו מאפשר dispatch נוסף. במהלך outage של האחסון אין הבטחת שמירת התראה; לאחר חזרת האחסון המדדים עדיין מגלים receipts עמומות, וניסיון מורשה נוסף יכול לשמור את ההתראה.
+
+הבדיקות מכסות מיצוי תקציב וקריאה אחרי פתיחה מחדש, זהות יציבה, מונים מקבילים, בידוד ארגונים, pagination, הרשאת scope נפרדת, אי־חשיפת payload, כשל כתיבת התראה ושינוי backlog לאחר מסירת audit ללא IO עסקי. המנגנון הוא inbox מקומי למפעיל; לא נוספה שליחת הודעות חיצוניות או הבטחת מסירת התראה למערכת ניטור שלא הוגדרה. הצפנת metadata במנוחה נשארת סעיף נפרד במטריצת הקבלה.

@@ -19,13 +19,13 @@
 | 005: עובד ישן חוזר | test_stale_execution_process.py מחזיק ילד חי לפני/אחרי אפקט הספק, מבצע replay בהורה ואז משחרר אותו | נוספה הוכחה ל־receipt סופית שאינה נדרסת, השפעה יחידה ואירוע outbox יחיד; PostgreSQL דורש CI לגרסה זו |
 | 006: audit לא זמין / acknowledgement אבד | complete_receipt + outbox באותה transaction; deliver_receipt_audit; test_receipt_audit.py | מכוסה מסירה אידמפוטנטית ו־rollback בשני backends; מצב delivery נשמר בטבלת outbox נפרדת ולא בשדה receipt |
 | 007: payload פג / restore ישן | test_receipt_retention.py, test_dispatch_witness.py | מכוסה מחיקת ciphertext בלי שחרור זהות, ו־quarantine כש־primary מפגר אחרי witness; הפעלה דורשת witness שלא שוחזר לאחור יחד עמו |
-| 007: תקציב בירור נגמר | lookup_count/maxLookups, maxAttempts/deadlines; בדיקות recovery/replay | עצירת IO מכוסה; התראה עמידה למורשה ו־metrics ייעודיים טרם מומשו |
+| 007: תקציב בירור נגמר | lookup_count/maxLookups, maxAttempts/deadlines; בדיקות recovery/replay | עצירת IO מכוסה; נוספו execution_notice עמיד ו־notices/metrics עם הרשאת executions:observe; מחייב CI עדכני |
 | 008: חלון הקריסה הקריטי | provider ledger נפרד, child exit, receipt/outbox ושחזור | מכוסה; מטריצת כל נקודות הקריסה והמצבים בין תהליכים עדיין אינה מלאה |
 
 ## סעיפים נוספים מה־design ומ־tasks שאינם סגורים
 
-1. מומשו recoveryBackoffMs, recoveryNotBefore עמיד ומשותף ל־lookup/replay ו־clockMarginMs. בדיקות פתיחה מחדש, אובדן commit acknowledgement ופקיעה משתמשות בשעון מוזרק; נדרשת ראיית CI עדכנית לשני backends.
-2. להוסיף התראות/מדדים ממוזערים עבור unknown, conflicts, blocked replay, outbox backlog וגיל receipt, בלי מזהי לקוחות בתוויות משותפות. התראה על מיצוי תקציב צריכה להיות ניתנת לצפייה למורשה אחרי restart.
+1. מומשו recoveryBackoffMs, recoveryNotBefore עמיד ומשותף ל־lookup/replay ו־clockMarginMs. בדיקות פתיחה מחדש, אובדן commit acknowledgement ופקיעה משתמשות בשעון מוזרק; אומת ב־CI של e61a8d8: 332 בדיקות עברו ללא דילוגים (run 35133361136).
+2. נוספו התראות עמידות עם זהות יציבה, מדדי states/backlog/age/notice codes ו־API ארגוני בהרשאת executions:observe. בדיקות restart, בידוד, כשל אחסון ומונים מקבילים נוספו; נדרש CI עדכני.
 3. accepted/pending מתשובת dispatch מאומתת מומש בחוזה dispatchOutcomes ובבדיקת crash/resume. אין הסקת success מ־HTTP accepted; הסעיף אומת ב־CI של a8d4630: 322 בדיקות עברו ללא דילוגים, כולל שני backends (run 35132662022).
 4. ה־design דורש quarantine לראיה סופית סותרת. כיום תוצאה מאוחרת אינה דורסת terminal receipt; זה אינו בפני עצמו מנגנון תיעוד/בירור של סתירה סמכותית.
 5. להשלים fault injection בתהליכים נפרדים לפני/אחרי intent, אחרי dispatch commit ולפני IO, ואחרי result commit לפני תגובת הלקוח/ack של audit. בדיקות transaction וחריגות באותו תהליך הן ראיות משלימות בלבד.

@@ -129,6 +129,13 @@ class DurableExecutor:
         return execution_binding(request, self.target(request).provider_account_id)
 
     def _error(self, req, code, receipt=None, *, unknown=False):
+        from .execution_observability import NOTICE_CODES
+        if receipt is not None and code in NOTICE_CODES:
+            try:
+                self.store.record_execution_notice(receipt.organization_id, receipt.receipt_id, code)
+            except Exception:
+                # Observability failure never grants dispatch or hides uncertainty.
+                code = "EXECUTION_NOTICE_STORE_UNAVAILABLE"
         return ConnectionResult(requestId=req.request_id, status="failed",
             serviceId=req.service.id or req.service.name.lower().replace(" ", "-"), capability=req.capability,
             auditId=receipt.audit_id or receipt.receipt_id if receipt else str(uuid4()),

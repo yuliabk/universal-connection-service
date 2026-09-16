@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import Field, SecretStr, field_validator
 from .receipt_store import SQLReceiptStore, receipt_schema, receipt_result_schema
+from .execution_observability import execution_notice_schema
 
 from .approvals import ApprovalRecord, ApprovalStore
 from .contracts import ConnectorManifest, Lifecycle, Model
@@ -181,6 +182,11 @@ _MIGRATIONS += (
     )),
 )
 
+_MIGRATIONS += (Migration(6, "execution_operational_notices", (
+    execution_notice_schema("ucs_internal."),
+    "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
+)),)
+
 LATEST_SCHEMA_VERSION = _MIGRATIONS[-1].version
 _MIGRATION_LOCK_KEY = 814434035
 
@@ -254,9 +260,12 @@ class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, Au
         return True
 
     def _receipt_sql(self, sql: str) -> str:
+        sql = sql.replace("execution_notice", "ucs_internal.execution_notice")
         for table in ("execution_receipt", "execution_attempt", "execution_outbox", "execution_result", "approval_grant", "audit_event", "dispatch_witness_identity", "dispatch_witness_attempt"):
             sql = sql.replace(table, "ucs_internal." + table)
         return sql.replace("?", "%s")
+
+    _receipt_created_expression = "(receipt_json::jsonb ->> 'createdAt')"
 
     def _receipt_time(self, value):
         return value

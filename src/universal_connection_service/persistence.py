@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
 from .receipt_store import SQLReceiptStore, receipt_schema, receipt_result_schema
+from .execution_observability import execution_notice_schema
 from .receipts import ReceiptStore
 
 from .contracts import (
@@ -197,6 +198,7 @@ class SQLiteStateStore(SQLReceiptStore):
                 for statement in receipt_schema():
                     self._connection.execute(statement)
                 self._connection.execute(receipt_result_schema())
+                self._connection.execute(execution_notice_schema())
                 columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(approval_grant)")}
                 for column in ("operation_id", "binding_digest", "revoked_at"):
                     if column not in columns:

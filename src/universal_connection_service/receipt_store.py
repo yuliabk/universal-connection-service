@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
 from .receipts import ExecutionIntent, ExecutionReceipt, ReceiptAudit, ReceiptError, utc_now
+from .execution_observability import ExecutionObservabilityStore
 
 
 def receipt_schema(prefix: str = "") -> tuple[str, ...]:
@@ -49,7 +50,7 @@ def receipt_schema(prefix: str = "") -> tuple[str, ...]:
     )
 
 
-class SQLReceiptStore:
+class SQLReceiptStore(ExecutionObservabilityStore):
     def _receipt_sql(self, sql: str) -> str:
         return sql
 

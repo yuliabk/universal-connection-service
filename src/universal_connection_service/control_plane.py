@@ -20,6 +20,7 @@ from .service import ConnectionService
 
 
 ControlPlaneScope = Literal[
+    "executions:observe",
     "connections:execute",
     "executions:replay",
     "executions:reconcile",
@@ -29,6 +30,7 @@ ControlPlaneScope = Literal[
     "connectors:promote",
 ]
 _ALLOWED_SCOPES = {
+    "executions:observe",
     "connections:execute",
     "executions:replay",
     "executions:reconcile",
