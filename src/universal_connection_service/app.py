@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from .approvals import ApprovalStore, PersistentApprovalVerifier
 from .contracts import ConnectionPlan, ConnectionRequest, ConnectionResult, ExecutionContext
 from .control_plane import ControlPlaneService, StaticBearerAuthenticator, build_control_plane_router
+from .credentials import AgentVaultCredentialResolver, AgentVaultCredentialResolverConfig
 from .discovery import DiscoveryEngine, MCPRegistryConfig, MCPRegistryDiscoveryProvider
 from .mcp_validation import MCPValidationService
 from .packages import (
@@ -61,6 +62,17 @@ def _build_control_plane_authenticator():
         raise RuntimeError("UCS_CONTROL_PLANE_CREDENTIALS_JSON is invalid") from exc
 
 
+def _build_credential_resolver():
+    raw = os.getenv("UCS_AGENT_VAULT_CONFIG_JSON")
+    if not raw:
+        return None, "disabled"
+    try:
+        config = AgentVaultCredentialResolverConfig.model_validate_json(raw)
+    except Exception as exc:
+        raise RuntimeError("UCS_AGENT_VAULT_CONFIG_JSON is invalid") from exc
+    return AgentVaultCredentialResolver(config), "agent_vault"
+
+
 def _package_loader_from_env():
     root = os.getenv("UCS_CONNECTOR_PACKAGE_DIR")
     if not root:
@@ -96,6 +108,7 @@ def _package_loader_from_env():
 state_store, state_kind = _build_state_store()
 discovery_engine, discovery_kind = _build_discovery_engine()
 control_plane_authenticator, control_plane_kind = _build_control_plane_authenticator()
+credential_resolver, credential_broker_kind = _build_credential_resolver()
 registry = ConnectorRegistry(state_store=state_store)
 approval_store = state_store if isinstance(state_store, ApprovalStore) else None
 approval_verifier = PersistentApprovalVerifier(approval_store) if approval_store is not None else None
@@ -109,6 +122,7 @@ service = ConnectionService(
 mcp_validation_service = MCPValidationService(
     registry,
     evidence_store=state_store,
+    credential_resolver=credential_resolver,
 )
 control_plane_service = ControlPlaneService(
     registry=registry,
@@ -160,6 +174,7 @@ def health():
         "state": state_kind,
         "discovery": discovery_kind,
         "controlPlane": control_plane_kind,
+        "credentialBroker": credential_broker_kind,
         "packages": {
             "loaded": package_rehydration.loaded,
             "skipped": package_rehydration.skipped,
