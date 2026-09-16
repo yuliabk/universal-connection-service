@@ -45,10 +45,11 @@ class ConnectorPackagePinService:
             EvidenceRecord(
                 evidenceId=str(uuid4()),
                 organizationId=registration.organization_id,
-                kind="package_verification",
-                phase="package",
+                kind="validation",
+                phase="validation",
                 connectorId=registration.manifest.connector_id,
                 payload={
+                    "type": "package_verification",
                     "digest": loaded.digest,
                     "version": registration.manifest.version,
                     "signerRef": loaded.signer_ref,
@@ -77,12 +78,13 @@ class ConnectorRuntimeRehydrator:
     def _pin_for(self, organization_id: str, connector_id: str, version: str):
         evidence = self.evidence_store.list_evidence(
             organization_id,
-            kind="package_verification",
+            kind="validation",
         )
         matches = [
             item
             for item in evidence
             if item.connector_id == connector_id
+            and item.payload.get("type") == "package_verification"
             and item.payload.get("verified") is True
             and item.payload.get("version") == version
             and isinstance(item.payload.get("digest"), str)
@@ -160,10 +162,15 @@ class ConnectorRuntimeRehydrator:
                 EvidenceRecord(
                     evidenceId=str(uuid4()),
                     organizationId=record.organization_id,
-                    kind="package_rehydration",
-                    phase="rehydration",
+                    kind="validation",
+                    phase="validation",
                     connectorId=connector_id,
-                    payload={"version": version, "status": status, "code": code},
+                    payload={
+                        "type": "package_rehydration",
+                        "version": version,
+                        "status": status,
+                        "code": code,
+                    },
                 )
             )
         return RehydrationReport(
