@@ -205,12 +205,7 @@ class SandboxPolicyService:
         except Exception:
             return SandboxCapabilityProfile()
 
-    def issue_approval(
-        self,
-        principal: ControlPlanePrincipal,
-        connector_id: str,
-        command: SandboxProfileApprovalCommand,
-    ) -> SandboxProfileApprovalIssued:
+    def issue_approval(self, principal: ControlPlanePrincipal, connector_id: str, command: SandboxProfileApprovalCommand) -> SandboxProfileApprovalIssued:
         self._require(principal, "approvals:issue", command.organization_id)
         if self.approval_store is None:
             raise ControlPlaneError("APPROVAL_STORE_UNAVAILABLE", "Persistent approval storage is not configured", status_code=503)
@@ -220,53 +215,33 @@ class SandboxPolicyService:
         raw = secrets.token_urlsafe(32)
         ref = approval_ref_hash(raw)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=command.expires_in_seconds)
-        self.approval_store.put_approval(
-            ApprovalRecord(
-                approvalRefHash=ref,
-                requestId=command.change_id,
-                organizationId=command.organization_id,
-                userId=principal.subject,
-                agentId=principal.token_id,
-                serviceId=_SANDBOX_POLICY_SERVICE,
-                capability=self._approval_capability(connector_id, command.version, profile_hash),
-                operation="update",
-                expiresAt=expires_at,
-            )
-        )
+        self.approval_store.put_approval(ApprovalRecord(
+            approvalRefHash=ref, requestId=command.change_id, organizationId=command.organization_id,
+            userId=principal.subject, agentId=principal.token_id, serviceId=_SANDBOX_POLICY_SERVICE,
+            capability=self._approval_capability(connector_id, command.version, profile_hash),
+            operation="update", expiresAt=expires_at,
+        ))
         if self.evidence_store is not None:
             self.evidence_store.append_evidence(EvidenceRecord(
-                evidenceId=str(uuid4()), organizationId=command.organization_id,
-                kind="approval_verification", phase="execution", requestId=command.change_id,
-                connectorId=connector_id,
-                payload={
-                    "type": "sandbox_profile_approval_issued",
-                    "version": command.version,
-                    "profileHash": profile_hash,
-                    "approvalRefHash": ref,
-                    "approverSubject": principal.subject,
-                    "expiresAt": expires_at.isoformat(),
-                },
+                evidenceId=str(uuid4()), organizationId=command.organization_id, kind="approval_verification",
+                phase="execution", requestId=command.change_id, connectorId=connector_id,
+                payload={"type": "sandbox_profile_approval_issued", "version": command.version,
+                         "profileHash": profile_hash, "approvalRefHash": ref,
+                         "approverSubject": principal.subject, "expiresAt": expires_at.isoformat()},
             ))
         return SandboxProfileApprovalIssued(
             changeId=command.change_id, connectorId=connector_id, version=command.version,
-            organizationId=command.organization_id, profileHash=profile_hash,
-            approvalId=raw, expiresAt=expires_at,
+            organizationId=command.organization_id, profileHash=profile_hash, approvalId=raw, expiresAt=expires_at,
         )
 
-    def apply(
-        self,
-        principal: ControlPlanePrincipal,
-        connector_id: str,
-        command: SandboxProfileApplyCommand,
-    ) -> SandboxProfileResult:
-        self._require(principal, "sandbox:manage", command.organization_id)
+    def apply(self, principal: ControlPlanePrincipal, connector_id: str, command: SandboxProfileApplyCommand) -> SandboxProfileResult:
+        self._require(principal, "connectors:promote", command.organization_id)
         if self.approval_store is None:
             raise ControlPlaneError("APPROVAL_STORE_UNAVAILABLE", "Persistent approval storage is not configured", status_code=503)
         self._trusted_connector(command.organization_id, connector_id, command.version)
         self.mount_catalog.validate_profile(command.organization_id, command.profile)
         profile_hash = command.profile.digest()
-        raw = command.approval_id.get_secret_value()
-        ref = approval_ref_hash(raw)
+        ref = approval_ref_hash(command.approval_id.get_secret_value())
         record = self.approval_store.get_approval(ref)
         now = datetime.now(timezone.utc)
         if record is None:
@@ -277,8 +252,7 @@ class SandboxPolicyService:
         if expires_at <= now:
             raise ControlPlaneError("APPROVAL_EXPIRED", "Sandbox profile approval has expired")
         expected = (
-            record.request_id == command.change_id
-            and record.organization_id == command.organization_id
+            record.request_id == command.change_id and record.organization_id == command.organization_id
             and record.service_id == _SANDBOX_POLICY_SERVICE
             and record.capability == self._approval_capability(connector_id, command.version, profile_hash)
             and record.operation == "update"
@@ -291,17 +265,11 @@ class SandboxPolicyService:
             raise ControlPlaneError("APPROVAL_ALREADY_USED", "Sandbox profile approval could not be consumed")
         if self.evidence_store is not None:
             self.evidence_store.append_evidence(EvidenceRecord(
-                evidenceId=str(uuid4()), organizationId=command.organization_id,
-                kind="approval_verification", phase="execution", requestId=command.change_id,
-                connectorId=connector_id,
-                payload={
-                    "type": "sandbox_profile_activated",
-                    "version": command.version,
-                    "profileHash": profile_hash,
-                    "approvalRefHash": ref,
-                    "appliedBy": principal.subject,
-                    "profile": command.profile.model_dump(by_alias=True, mode="json"),
-                },
+                evidenceId=str(uuid4()), organizationId=command.organization_id, kind="approval_verification",
+                phase="execution", requestId=command.change_id, connectorId=connector_id,
+                payload={"type": "sandbox_profile_activated", "version": command.version,
+                         "profileHash": profile_hash, "approvalRefHash": ref, "appliedBy": principal.subject,
+                         "profile": command.profile.model_dump(by_alias=True, mode="json")},
             ))
         return SandboxProfileResult(
             organizationId=command.organization_id, connectorId=connector_id, version=command.version,
@@ -318,10 +286,7 @@ class SandboxPolicyService:
         )
 
 
-def build_sandbox_policy_router(
-    service: SandboxPolicyService | None,
-    authenticator: StaticBearerAuthenticator | None,
-) -> APIRouter:
+def build_sandbox_policy_router(service: SandboxPolicyService | None, authenticator: StaticBearerAuthenticator | None) -> APIRouter:
     router = APIRouter(prefix="/v1/control-plane/connectors", tags=["sandbox-policy"])
 
     def principal(authorization: str | None) -> ControlPlanePrincipal:
