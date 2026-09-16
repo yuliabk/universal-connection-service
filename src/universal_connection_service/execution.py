@@ -18,6 +18,7 @@ from .approvals import approval_ref_hash
 from .contracts import ConnectionError, ConnectionRequest, ConnectionResult, ConnectorResult, Model, Operation
 from .receipts import ExecutionIntent, ReceiptError, execution_binding, utc_now
 from .recovery import RecoveryContract, ProviderExecutionKey, ProviderOutcome
+from .provider_calls import ProviderCalls
 
 
 class ExecutionTarget(Model):
@@ -100,6 +101,7 @@ class DurableExecutor:
         self.store = store
         witness.assert_independent(store)
         self.witness = witness
+        self.provider_calls = ProviderCalls()
         self.cipher = cipher
         self.targets = tuple(target.model_copy(deep=True) for target in targets)
         keys = [(t.organization_id, t.service_id, t.capability) for t in self.targets]
@@ -179,10 +181,11 @@ class DurableExecutor:
             timeout = min(timeout, (receipt.provider_not_after - utc_now()).total_seconds())
         if timeout <= 0:
             raise ReceiptError("REPLAY_BUDGET_EXHAUSTED")
-        call = (registration.connector.execute_keyed(req.capability, req.model_copy(deep=True).input,
+        def call():
+            return (registration.connector.execute_keyed(req.capability, req.model_copy(deep=True).input,
                 ctx.model_copy(deep=True), self._provider_key(receipt)) if contract else
                 registration.connector.execute(req.capability, req.model_copy(deep=True).input, ctx.model_copy(deep=True)))
-        result = await asyncio.wait_for(call, timeout=timeout)
+        result = await self.provider_calls.run(call, timeout)
         if not isinstance(result, ConnectorResult) or result.status != "success":
             receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id, receipt.version, "unknown")
             return self._error(req, "OUTCOME_UNKNOWN", receipt)
@@ -233,8 +236,8 @@ class DurableExecutor:
             timeout = min(timeout, (deadline - utc_now()).total_seconds())
             if timeout <= 0:
                 raise ReceiptError("RECOVERY_BUDGET_EXHAUSTED")
-            outcome = await asyncio.wait_for(registration.connector.lookup_execution(
-                req.capability, ctx.model_copy(deep=True), key.model_copy(deep=True)), timeout=timeout)
+            outcome = await self.provider_calls.run(lambda: registration.connector.lookup_execution(
+                req.capability, ctx.model_copy(deep=True), key.model_copy(deep=True)), timeout)
             if isinstance(outcome, ProviderOutcome):
                 # Revalidate even a model instance: adapter code could mutate it.
                 outcome = ProviderOutcome.model_validate(outcome.model_dump())
