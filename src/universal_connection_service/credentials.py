@@ -170,11 +170,14 @@ class AgentVaultCredentialResolver:
         return binding
 
     def _management_client(self) -> httpx.AsyncClient:
+        authorization = f"Bearer {self.config.agent_token.get_secret_value()}"
         if self._management_client_factory is not None:
-            return self._management_client_factory()
+            client = self._management_client_factory()
+            client.headers["Authorization"] = authorization
+            return client
         return httpx.AsyncClient(
             base_url=self.config.address,
-            headers={"Authorization": f"Bearer {self.config.agent_token.get_secret_value()}"},
+            headers={"Authorization": authorization},
             follow_redirects=False,
             trust_env=False,
             timeout=15.0,
