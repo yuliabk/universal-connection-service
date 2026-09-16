@@ -39,6 +39,8 @@ from .sandbox_build import (
     SandboxBuildAwareAutoConnectOrchestrator,
     SandboxMCPPackageAcquirer,
 )
+from .sandbox_credentials import AgentVaultSandboxBroker
+from .sandbox_policy import SandboxMountCatalog, SandboxPolicyService, build_sandbox_policy_router
 from .service import ConnectionService
 
 
@@ -108,6 +110,13 @@ def _build_credential_resolver():
     return AgentVaultCredentialResolver(config), "agent_vault"
 
 
+def _build_mount_catalog():
+    try:
+        return SandboxMountCatalog.from_json(os.getenv("UCS_MCP_SANDBOX_MOUNTS_JSON"))
+    except ValueError as exc:
+        raise RuntimeError("UCS_MCP_SANDBOX_MOUNTS_JSON is invalid") from exc
+
+
 def _signing_public_key(signing_key_b64: str) -> bytes:
     try:
         private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(signing_key_b64, validate=True))
@@ -164,7 +173,7 @@ def _build_package_runtime():
     return ConnectorPackageLoader(source, verifier), openapi_builder, sandbox_builder, mode
 
 
-def _build_sandbox_runner(artifact_store):
+def _build_sandbox_runner(artifact_store, policy_service, mount_catalog, resolver):
     if not _env_bool("UCS_MCP_PACKAGE_SANDBOX_ENABLED"):
         return None, "disabled"
     if artifact_store is None:
@@ -178,8 +187,17 @@ def _build_sandbox_runner(artifact_store):
         pidsLimit=int(os.getenv("UCS_MCP_SANDBOX_PIDS", "64")),
         tmpfsBytes=int(os.getenv("UCS_MCP_SANDBOX_TMPFS_BYTES", str(64 * 1024 * 1024))),
         startupTimeoutSeconds=float(os.getenv("UCS_MCP_SANDBOX_STARTUP_TIMEOUT", "5")),
+        egressNetwork=os.getenv("UCS_MCP_SANDBOX_EGRESS_NETWORK"),
+        egressProxyHost=os.getenv("UCS_MCP_SANDBOX_EGRESS_PROXY_HOST"),
     )
-    return DockerMCPBSandboxRunner(artifact_store, config), "docker"
+    broker = AgentVaultSandboxBroker(resolver) if isinstance(resolver, AgentVaultCredentialResolver) else None
+    return DockerMCPBSandboxRunner(
+        artifact_store,
+        config,
+        profile_provider=policy_service,
+        mount_resolver=mount_catalog,
+        credential_broker=broker,
+    ), "docker+policy"
 
 
 def _bind_runtime_connector(connector):
@@ -206,6 +224,14 @@ registry = ConnectorRegistry(state_store=state_store)
 approval_store = state_store if isinstance(state_store, ApprovalStore) else None
 workflow_store = state_store if isinstance(state_store, WorkflowStore) else None
 approval_verifier = PersistentApprovalVerifier(approval_store) if approval_store is not None else None
+mount_catalog = _build_mount_catalog()
+sandbox_policy_service = SandboxPolicyService(
+    registry=registry,
+    evidence_store=state_store,
+    approval_store=approval_store,
+    mount_catalog=mount_catalog,
+    require_distinct_approver=_env_bool("UCS_CONTROL_PLANE_REQUIRE_DISTINCT_APPROVER"),
+)
 service = ConnectionService(
     registry,
     approval_verifier=approval_verifier,
@@ -230,7 +256,9 @@ control_plane_service = ControlPlaneService(
 artifact_dir = os.getenv("UCS_BUILD_ARTIFACT_DIR")
 generic_artifact_store = FilesystemBuildArtifactStore(artifact_dir) if artifact_dir else None
 mcpb_artifact_store = FilesystemMCPBArtifactStore(artifact_dir) if artifact_dir else None
-mcp_sandbox_runner, mcp_sandbox_kind = _build_sandbox_runner(mcpb_artifact_store)
+mcp_sandbox_runner, mcp_sandbox_kind = _build_sandbox_runner(
+    mcpb_artifact_store, sandbox_policy_service, mount_catalog, credential_resolver
+)
 mcp_package_acquirer = MCPPackageAcquirer(generic_artifact_store)
 build_pipeline = ConnectorBuildPipeline(
     registry=registry,
@@ -293,6 +321,7 @@ build_kind = (
     if auto_connect_orchestrator is not None
     else "disabled"
 )
+sandbox_policy_kind = "approved-profiles" if mcp_sandbox_runner is not None else "disabled"
 package_rehydration = RehydrationReport()
 
 
@@ -321,6 +350,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Universal Connection Service", version="0.1.0", lifespan=lifespan)
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
 app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
+app.include_router(build_sandbox_policy_router(sandbox_policy_service, control_plane_authenticator))
 
 
 @app.get("/health")
@@ -336,6 +366,7 @@ def health():
         "buildPipeline": build_kind,
         "packageVerifier": package_kind,
         "packageSandbox": mcp_sandbox_kind,
+        "sandboxPolicy": sandbox_policy_kind,
         "packages": {
             "loaded": package_rehydration.loaded,
             "skipped": package_rehydration.skipped,
