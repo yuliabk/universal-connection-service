@@ -195,16 +195,27 @@ class FileProvider(Provider):
             result=ConnectorResult(status="success", data={"recoveredAfterCrash": True}))
 
 
-def test_process_crash_after_provider_commit_then_keyed_lookup_recovers(tmp_path):
+def test_process_crash_after_provider_commit_then_keyed_lookup_recovers(tmp_path, stores):
     req = request()
-    store_path, provider_path = tmp_path / "ucs.sqlite3", tmp_path / "provider.sqlite3"
+    initial = stores()
+    backend = "sqlite" if isinstance(initial, SQLiteStateStore) else "postgres"
+    store_path = initial.path if backend == "sqlite" else "postgres"
+    witness_path = str(store_path) + ".witness.sqlite3" if backend == "sqlite" else str(initial.test_witness_path)
+    provider_path = tmp_path / "provider.sqlite3"
     script = """
-import sys
+import os, sys
 sys.path.insert(0, sys.argv[1])
 from test_execution_recovery import *
 from universal_connection_service.contracts import ConnectionRequest
 req = ConnectionRequest.model_validate_json(sys.argv[4])
-store = SQLiteStateStore(sys.argv[2])
+if sys.argv[5] == "sqlite":
+    store = SQLiteStateStore(sys.argv[2])
+else:
+    from pydantic import SecretStr
+    from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
+    store = PostgresStateStore(PostgresStoreConfig(
+        dsn=SecretStr(os.environ["UCS_TEST_POSTGRES_URL"]), sslmode="disable"))
+    store.test_witness_path = sys.argv[6]
 recovery = contract()
 provider = FileProvider(recovery, sys.argv[3])
 target = make_target(req).model_copy(update={"recovery": recovery})
@@ -213,9 +224,10 @@ raw = approve(store, req, raw=req.actor.organization_id)
 execute(svc, req, raw)
 """
     child = subprocess.run([sys.executable, "-c", script, str(Path(__file__).parent),
-        str(store_path), str(provider_path), req.model_dump_json()], capture_output=True, timeout=30)
+        str(store_path), str(provider_path), req.model_dump_json(), backend, witness_path],
+        capture_output=True, timeout=30)
     assert child.returncode == 42, child.stderr.decode(errors="replace")
-    store = SQLiteStateStore(store_path)
+    store = stores()
     provider = FileProvider(contract(), provider_path)
     target = make_target(req).model_copy(update={"recovery": contract()})
     svc, _ = build_service(store, req, connector=provider, target=target)
