@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from .compiler import ConnectionCompiler
 from .contracts import ConnectionError, ConnectionRequest, ConnectionResult, ExecutionContext
+from .discovery import DiscoveryEngine
 from .persistence import AuditEvent, AuditStore, EvidenceRecord, EvidenceStore
 from .policy import ApprovalVerifier, PolicyEngine
 from .registry import ConnectorRegistry
@@ -19,12 +20,14 @@ class ConnectionService:
         *,
         audit_store: AuditStore | None = None,
         evidence_store: EvidenceStore | None = None,
+        discovery_engine: DiscoveryEngine | None = None,
     ):
         self.registry = registry
         self.compiler = ConnectionCompiler(
             registry,
             policy_engine=policy_engine,
             evidence_store=evidence_store,
+            discovery_engine=discovery_engine,
         )
         self.approval_verifier = approval_verifier
         self.audit_store = audit_store
@@ -250,8 +253,6 @@ class ConnectionService:
                     approval_id=ctx.approval_id,
                 )
             try:
-                # Approvals authorize one execution attempt. Consume before the
-                # outbound call to prevent concurrent replay of a valid grant.
                 await self.approval_verifier.consume(ctx.approval_id)
             except Exception as exc:
                 code = getattr(exc, "code", "APPROVAL_VERIFICATION_UNAVAILABLE")
