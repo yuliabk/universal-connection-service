@@ -16,13 +16,13 @@ from .control_plane import (
     ControlPlaneError,
     ControlPlanePrincipal,
     ControlPlaneService,
+    MCPValidationCommand,
     PromotionApprovalCommand,
     PromotionApprovalIssued,
     PromotionCommand,
     StaticBearerAuthenticator,
 )
-from .mcp_validation import MCPValidationCommand
-from .persistence import ConnectionWorkflowRecord, EvidenceRecord, EvidenceStore, WorkflowStage, WorkflowStore, utc_now
+from .persistence import ConnectionWorkflowRecord, EvidenceRecord, EvidenceStore, WorkflowStage, WorkflowStore
 from .registry import ConnectorRegistry
 from .service import ConnectionService
 
@@ -106,12 +106,7 @@ class AutoConnectError(RuntimeError):
 
 
 class AutoConnectOrchestrator:
-    """Persistent, resumable coordinator over existing UCS trust gates.
-
-    The workflow store never receives ConnectionRequest.input or credentials.
-    Callers must resubmit the exact ConnectionRequest on each advance; a
-    canonical SHA-256 fingerprint detects any mutation across resumes.
-    """
+    """Persistent coordinator over the existing UCS discovery/trust/execution gates."""
 
     LEASE_SECONDS = 120
 
@@ -135,8 +130,8 @@ class AutoConnectOrchestrator:
     @staticmethod
     def _fingerprint(request: ConnectionRequest) -> str:
         payload = request.model_dump(by_alias=True, mode="json")
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
 
     @staticmethod
     def _service_id(request: ConnectionRequest) -> str:
@@ -153,7 +148,9 @@ class AutoConnectOrchestrator:
 
     @staticmethod
     def _next_action(record: ConnectionWorkflowRecord) -> NextAction:
-        mapping: dict[str, NextAction] = {
+        if record.stage == "planning" and record.last_code == "MCP_VALIDATION_RETRYABLE":
+            return "retry_validation"
+        return {
             "planning": "advance",
             "awaiting_candidate_selection": "select_candidate",
             "awaiting_build": "build_connector",
@@ -165,16 +162,10 @@ class AutoConnectOrchestrator:
             "ready_to_execute": "advance",
             "completed": "none",
             "failed": "restart",
-        }
-        return mapping[record.stage]
+        }[record.stage]
 
     @classmethod
-    def _view(cls, record: ConnectionWorkflowRecord, *, execution_approval_issued: bool = False) -> AutoConnectWorkflowView:
-        next_action = cls._next_action(record)
-        if record.stage == "awaiting_execution_approval" and execution_approval_issued:
-            next_action = "provide_execution_approval"
-        if record.stage == "planning" and record.last_code == "MCP_VALIDATION_RETRYABLE":
-            next_action = "retry_validation"
+    def _view(cls, record: ConnectionWorkflowRecord) -> AutoConnectWorkflowView:
         return AutoConnectWorkflowView(
             workflowId=record.workflow_id,
             requestId=record.request_id,
@@ -191,54 +182,37 @@ class AutoConnectOrchestrator:
             lastCode=record.last_code,
             resultAuditId=record.result_audit_id,
             revision=record.revision,
-            nextAction=next_action,
+            nextAction=cls._next_action(record),
             updatedAt=record.updated_at,
         )
-
-    def status(self, principal: ControlPlanePrincipal, organization_id: str, workflow_id: str) -> AutoConnectResponse:
-        self._require_review(principal, organization_id)
-        record = self.workflow_store.get_workflow(organization_id, workflow_id)
-        if record is None:
-            raise AutoConnectError("WORKFLOW_NOT_FOUND", "Connection workflow was not found", status_code=404)
-        return AutoConnectResponse(workflow=self._view(record))
 
     def _assert_request(self, record: ConnectionWorkflowRecord, request: ConnectionRequest) -> None:
         if request.actor.organization_id != record.organization_id:
             raise AutoConnectError("WORKFLOW_SCOPE_MISMATCH", "Connection request organization does not match workflow", status_code=403)
         if request.request_id != record.request_id or self._fingerprint(request) != record.request_fingerprint:
-            raise AutoConnectError(
-                "WORKFLOW_REQUEST_MISMATCH",
-                "Resume requires the exact original ConnectionRequest",
-                status_code=409,
-            )
+            raise AutoConnectError("WORKFLOW_REQUEST_MISMATCH", "Resume requires the exact original ConnectionRequest")
 
     def _claim(self, record: ConnectionWorkflowRecord) -> str:
         token = secrets.token_urlsafe(24)
         now = datetime.now(timezone.utc)
-        if not self.workflow_store.claim_workflow(
+        ok = self.workflow_store.claim_workflow(
             record.organization_id,
             record.workflow_id,
             token,
             now + timedelta(seconds=self.LEASE_SECONDS),
             now,
-        ):
-            raise AutoConnectError("WORKFLOW_BUSY", "Connection workflow is already being advanced", status_code=409)
+        )
+        if not ok:
+            raise AutoConnectError("WORKFLOW_BUSY", "Connection workflow is already being advanced")
         return token
 
-    def _save(self, record: ConnectionWorkflowRecord, *, expected_revision: int, lease_token: str) -> ConnectionWorkflowRecord:
-        if not self.workflow_store.update_claimed_workflow(
-            record,
-            expected_revision=expected_revision,
-            lease_token=lease_token,
-        ):
-            raise AutoConnectError("WORKFLOW_CONFLICT", "Connection workflow changed concurrently", status_code=409)
+    def _save(self, record: ConnectionWorkflowRecord, revision: int, lease: str) -> ConnectionWorkflowRecord:
+        if not self.workflow_store.update_claimed_workflow(record, expected_revision=revision, lease_token=lease):
+            raise AutoConnectError("WORKFLOW_CONFLICT", "Connection workflow changed concurrently")
         refreshed = self.workflow_store.get_workflow(record.organization_id, record.workflow_id)
         if refreshed is None:
             raise AutoConnectError("WORKFLOW_NOT_FOUND", "Connection workflow disappeared", status_code=404)
         return refreshed
-
-    def _release(self, record: ConnectionWorkflowRecord, lease_token: str) -> None:
-        self.workflow_store.release_workflow(record.organization_id, record.workflow_id, lease_token)
 
     def _new_record(self, request: ConnectionRequest) -> ConnectionWorkflowRecord:
         return ConnectionWorkflowRecord(
@@ -252,26 +226,32 @@ class AutoConnectOrchestrator:
             stage="planning",
         )
 
+    def status(self, principal: ControlPlanePrincipal, organization_id: str, workflow_id: str) -> AutoConnectResponse:
+        self._require_review(principal, organization_id)
+        record = self.workflow_store.get_workflow(organization_id, workflow_id)
+        if record is None:
+            raise AutoConnectError("WORKFLOW_NOT_FOUND", "Connection workflow was not found", status_code=404)
+        return AutoConnectResponse(workflow=self._view(record))
+
     async def start(self, principal: ControlPlanePrincipal, command: AutoConnectStartCommand) -> AutoConnectResponse:
         request = command.request
-        self._require_review(principal, request.actor.organization_id)
-        existing = self.workflow_store.get_workflow_by_request(request.actor.organization_id, request.request_id)
+        organization_id = request.actor.organization_id
+        self._require_review(principal, organization_id)
+        existing = self.workflow_store.get_workflow_by_request(organization_id, request.request_id)
         if existing is not None:
             self._assert_request(existing, request)
             if existing.stage != "planning":
                 return AutoConnectResponse(workflow=self._view(existing))
-            return await self.advance(principal, existing.workflow_id, AutoConnectAdvanceCommand(**command.model_dump(by_alias=True)))
-
-        record = self._new_record(request)
+            return await self.advance(principal, existing.workflow_id, AutoConnectAdvanceCommand.model_validate(command.model_dump()))
         try:
-            created = self.workflow_store.create_workflow(record)
+            created = self.workflow_store.create_workflow(self._new_record(request))
         except Exception:
-            existing = self.workflow_store.get_workflow_by_request(request.actor.organization_id, request.request_id)
+            existing = self.workflow_store.get_workflow_by_request(organization_id, request.request_id)
             if existing is None:
                 raise
             self._assert_request(existing, request)
             created = existing
-        return await self.advance(principal, created.workflow_id, AutoConnectAdvanceCommand(**command.model_dump(by_alias=True)))
+        return await self.advance(principal, created.workflow_id, AutoConnectAdvanceCommand.model_validate(command.model_dump()))
 
     async def advance(
         self,
@@ -290,18 +270,18 @@ class AutoConnectOrchestrator:
             return AutoConnectResponse(workflow=self._view(record))
 
         lease = self._claim(record)
-        expected_revision = record.revision
+        revision = record.revision
         try:
-            response = await self._drive(principal, record, command)
-            saved = self._save(record, expected_revision=expected_revision, lease_token=lease)
+            transient = await self._drive(principal, record, command)
+            saved = self._save(record, revision, lease)
             return AutoConnectResponse(
                 workflow=self._view(saved),
-                plan=response.plan,
-                candidates=response.candidates,
-                result=response.result,
+                plan=transient.plan,
+                candidates=transient.candidates,
+                result=transient.result,
             )
         except Exception:
-            self._release(record, lease)
+            self.workflow_store.release_workflow(record.organization_id, record.workflow_id, lease)
             raise
 
     async def _drive(
@@ -325,9 +305,9 @@ class AutoConnectOrchestrator:
 
         candidate = self._select_candidate(record, command, plan)
         if candidate is None:
-            if plan.requires_selection and plan.discovery_candidates:
+            if record.last_code == "DISCOVERY_CANDIDATE_STALE" or (plan.requires_selection and plan.discovery_candidates):
                 record.stage = "awaiting_candidate_selection"
-                record.last_code = "CANDIDATE_SELECTION_REQUIRED"
+                record.last_code = record.last_code or "CANDIDATE_SELECTION_REQUIRED"
                 return AutoConnectResponse(workflow=self._view(record), plan=plan, candidates=plan.discovery_candidates)
             record.stage = "awaiting_build"
             record.last_code = "CONNECTION_BUILD_REQUIRED"
@@ -358,13 +338,12 @@ class AutoConnectOrchestrator:
             if validation.code == "MCP_TOOL_SELECTION_REQUIRED":
                 record.stage = "awaiting_tool_selection"
                 record.last_code = validation.code
-                return AutoConnectResponse(workflow=self._view(record), plan=plan, candidates=plan.discovery_candidates)
-            if validation.code.startswith("CREDENTIAL_"):
+            elif validation.code.startswith("CREDENTIAL_"):
                 record.stage = "awaiting_credentials"
                 record.last_code = validation.code
-                return AutoConnectResponse(workflow=self._view(record), plan=plan, candidates=plan.discovery_candidates)
-            record.stage = "planning"
-            record.last_code = "MCP_VALIDATION_RETRYABLE"
+            else:
+                record.stage = "planning"
+                record.last_code = "MCP_VALIDATION_RETRYABLE"
             return AutoConnectResponse(workflow=self._view(record), plan=plan, candidates=plan.discovery_candidates)
 
         record.selected_tool = validation.selected_tool
@@ -387,9 +366,7 @@ class AutoConnectOrchestrator:
         candidate = next((item for item in plan.discovery_candidates if item.candidate_id == candidate_id), None)
         if candidate is None:
             record.selected_candidate_id = None
-            record.stage = "awaiting_candidate_selection"
             record.last_code = "DISCOVERY_CANDIDATE_STALE"
-            return None
         return candidate
 
     async def _drive_execution(
@@ -404,8 +381,8 @@ class AutoConnectOrchestrator:
             record.last_code = "CREDENTIAL_HANDLE_REQUIRED"
             return AutoConnectResponse(workflow=self._view(record), plan=plan)
 
-        approval_id = command.execution_approval_id.get_secret_value() if command.execution_approval_id else None
-        if plan.policy_decision == "REQUIRE_APPROVAL" and approval_id is None:
+        approval = command.execution_approval_id.get_secret_value() if command.execution_approval_id else None
+        if plan.policy_decision == "REQUIRE_APPROVAL" and approval is None:
             record.stage = "awaiting_execution_approval"
             record.last_code = "EXECUTION_APPROVAL_REQUIRED"
             return AutoConnectResponse(workflow=self._view(record), plan=plan)
@@ -422,7 +399,7 @@ class AutoConnectOrchestrator:
                 userId=request.actor.user_id,
                 organizationId=request.actor.organization_id,
                 credentialHandle=command.credential_handle,
-                approvalId=approval_id,
+                approvalId=approval,
                 deadlineMs=command.deadline_ms,
             ),
         )
@@ -453,10 +430,10 @@ class AutoConnectOrchestrator:
         record = self.workflow_store.get_workflow(organization_id, workflow_id)
         if record is None:
             raise AutoConnectError("WORKFLOW_NOT_FOUND", "Connection workflow was not found", status_code=404)
-        if record.stage != "awaiting_promotion_approval" or not record.connector_id or not record.connector_version or not record.promotion_id:
+        if record.stage != "awaiting_promotion_approval" or not all((record.connector_id, record.connector_version, record.promotion_id)):
             raise AutoConnectError("WORKFLOW_NOT_AWAITING_PROMOTION_APPROVAL", "Workflow is not awaiting connector promotion approval")
         lease = self._claim(record)
-        expected_revision = record.revision
+        revision = record.revision
         try:
             issued = self.control_plane_service.issue_promotion_approval(
                 principal,
@@ -470,10 +447,10 @@ class AutoConnectOrchestrator:
             )
             record.stage = "awaiting_promotion"
             record.last_code = "PROMOTION_APPROVAL_ISSUED"
-            saved = self._save(record, expected_revision=expected_revision, lease_token=lease)
+            saved = self._save(record, revision, lease)
             return self._view(saved), issued
         except Exception:
-            self._release(record, lease)
+            self.workflow_store.release_workflow(record.organization_id, record.workflow_id, lease)
             raise
 
     async def promote_and_advance(
@@ -489,13 +466,13 @@ class AutoConnectOrchestrator:
         if record is None:
             raise AutoConnectError("WORKFLOW_NOT_FOUND", "Connection workflow was not found", status_code=404)
         self._assert_request(record, request)
-        if record.stage != "awaiting_promotion" or not record.connector_id or not record.connector_version or not record.promotion_id:
+        if record.stage != "awaiting_promotion" or not all((record.connector_id, record.connector_version, record.promotion_id)):
             return await self.advance(principal, workflow_id, command)
         if command.promotion_approval_id is None:
             return AutoConnectResponse(workflow=self._view(record))
 
         lease = self._claim(record)
-        expected_revision = record.revision
+        revision = record.revision
         try:
             self.control_plane_service.promote(
                 principal,
@@ -509,9 +486,9 @@ class AutoConnectOrchestrator:
             )
             record.stage = "planning"
             record.last_code = "CONNECTOR_TRUSTED"
-            saved = self._save(record, expected_revision=expected_revision, lease_token=lease)
+            saved = self._save(record, revision, lease)
         except Exception:
-            self._release(record, lease)
+            self.workflow_store.release_workflow(record.organization_id, record.workflow_id, lease)
             raise
         return await self.advance(principal, saved.workflow_id, command)
 
@@ -588,14 +565,14 @@ def build_auto_connect_router(
             raise HTTPException(status_code=503, detail={"code": "AUTO_CONNECT_DISABLED", "message": "Persistent auto-connect orchestration is not configured"})
         if authenticator is None:
             raise HTTPException(status_code=503, detail={"code": "CONTROL_PLANE_DISABLED", "message": "Control plane is not configured"})
-        value = authenticator.authenticate(authorization)
-        if value is None:
+        actor = authenticator.authenticate(authorization)
+        if actor is None:
             raise HTTPException(
                 status_code=401,
                 detail={"code": "CONTROL_PLANE_UNAUTHENTICATED", "message": "Valid control-plane bearer token required"},
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return value
+        return actor
 
     def fail(exc: Exception):
         if isinstance(exc, (AutoConnectError, ControlPlaneError)):
@@ -650,10 +627,7 @@ def build_auto_connect_router(
         try:
             assert orchestrator is not None
             workflow, issued = orchestrator.issue_promotion_approval(
-                actor,
-                workflow_id,
-                organization_id,
-                expires_in_seconds=expires_in_seconds,
+                actor, workflow_id, organization_id, expires_in_seconds=expires_in_seconds
             )
             return {
                 "workflow": workflow.model_dump(by_alias=True, mode="json"),
