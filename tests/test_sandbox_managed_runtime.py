@@ -132,7 +132,7 @@ class NonSandboxConnector:
             serviceId="records",
             name="Not sandboxed",
             version="1.0.0",
-            strategy="official_api",
+            strategy="api",
             capabilities=("records.read",),
             auth=AuthRequirement(type="none"),
         )
