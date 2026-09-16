@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
@@ -17,6 +18,11 @@ from .contracts import (
     ConnectorResult,
     ExecutionContext,
     Model,
+)
+from .credentials import (
+    CredentialResolutionError,
+    CredentialResolver,
+    CredentialTarget,
 )
 
 try:
@@ -80,21 +86,18 @@ class OpenAPICompileResult:
 
 
 class OpenAPIConnectorAdapter:
-    """Generated REST/OpenAPI implementation of ConnectorContract.
-
-    Stable UCS capabilities are bound to validated OpenAPI operations. The
-    adapter never accepts raw credential values. Authenticated clients must be
-    supplied by a future CredentialResolver-backed client factory.
-    """
+    """Generated REST/OpenAPI implementation of ConnectorContract with brokered auth."""
 
     def __init__(
         self,
         config: OpenAPIConnectorConfig,
         *,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        credential_resolver: CredentialResolver | None = None,
     ) -> None:
         self.config = config
         self._client_factory = client_factory
+        self._credential_resolver = credential_resolver
         self._bindings = {binding.capability: binding for binding in config.bindings}
 
     def manifest(self) -> ConnectorManifest:
@@ -114,10 +117,43 @@ class OpenAPIConnectorAdapter:
         # evidence belongs to validation against an explicit sandbox.
         return bool(self._bindings) and ctx.deadline_ms > 0
 
-    def _client(self) -> httpx.AsyncClient:
+    def _direct_client(self) -> httpx.AsyncClient:
         if self._client_factory is not None:
             return self._client_factory()
-        return httpx.AsyncClient(base_url=self.config.endpoint.base_url, follow_redirects=False)
+        return httpx.AsyncClient(
+            base_url=self.config.endpoint.base_url,
+            follow_redirects=False,
+            trust_env=False,
+        )
+
+    @asynccontextmanager
+    async def _client(self, binding: OpenAPIOperationBinding, ctx: ExecutionContext):
+        if self._client_factory is not None or binding.auth.type == "none":
+            async with self._direct_client() as client:
+                yield client
+            return
+
+        if self._credential_resolver is None:
+            raise CredentialResolutionError(
+                "CREDENTIAL_RESOLUTION_UNAVAILABLE",
+                "Authenticated OpenAPI transport requires a credential resolver",
+                user_action_required=True,
+            )
+        if ctx.credential_handle is None:
+            raise CredentialResolutionError(
+                "CREDENTIAL_HANDLE_REQUIRED",
+                "Authenticated connection requires a credential handle",
+                user_action_required=True,
+            )
+
+        target = CredentialTarget(
+            transport="http",
+            serviceId=self.config.service_id,
+            url=self.config.endpoint.base_url,
+            auth=binding.auth,
+        )
+        async with self._credential_resolver.http_client(target, ctx) as client:
+            yield client
 
     @staticmethod
     def _render_path(template: str, values: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -146,16 +182,6 @@ class OpenAPIConnectorAdapter:
                 error=ConnectionError(
                     code="CAPABILITY_UNAVAILABLE",
                     message="Connector does not expose the requested capability",
-                ),
-            )
-
-        if binding.auth.type != "none" and self._client_factory is None:
-            return ConnectorResult(
-                status="failed",
-                error=ConnectionError(
-                    code="CREDENTIAL_RESOLUTION_UNAVAILABLE",
-                    message="Authenticated OpenAPI transport requires a credential resolver",
-                    userActionRequired=True,
                 ),
             )
 
@@ -197,13 +223,22 @@ class OpenAPIConnectorAdapter:
 
         try:
             async with asyncio.timeout(ctx.deadline_ms / 1000):
-                async with self._client() as client:
+                async with self._client(binding, ctx) as client:
                     response = await client.request(
                         binding.method,
                         rendered_path,
                         params=query or None,
                         json=body if body is not None else None,
                     )
+        except CredentialResolutionError as exc:
+            return ConnectorResult(
+                status="failed",
+                error=ConnectionError(
+                    code=exc.code,
+                    message=exc.safe_message,
+                    userActionRequired=exc.user_action_required,
+                ),
+            )
         except TimeoutError:
             return ConnectorResult(
                 status="failed",
@@ -316,6 +351,7 @@ def compile_openapi_connector(
     version: str,
     base_url: str,
     client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    credential_resolver: CredentialResolver | None = None,
 ) -> OpenAPICompileResult:
     """Validate an OpenAPI document and compile supported operations into a candidate connector."""
     if validate_openapi_spec is None:
@@ -369,6 +405,10 @@ def compile_openapi_connector(
         auth=_aggregate_auth(bindings),
     )
     return OpenAPICompileResult(
-        connector=OpenAPIConnectorAdapter(config, client_factory=client_factory),
+        connector=OpenAPIConnectorAdapter(
+            config,
+            client_factory=client_factory,
+            credential_resolver=credential_resolver,
+        ),
         skipped_operations=tuple(skipped),
     )
