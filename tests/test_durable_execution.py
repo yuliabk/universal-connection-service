@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import sys
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import pytest
@@ -324,4 +325,51 @@ def test_registered_effect_capability_cannot_be_mislabeled_read(stores):
     svc, connector = build_service(store, req)
     result = execute(svc, req.model_copy(update={"operation": "read", "read_only": True}))
     assert result.error.code == "EXECUTION_TARGET_DENIED"
+    assert connector.calls == 0
+
+
+def test_two_service_instances_share_one_approval_and_effect(stores):
+    first_store, second_store = stores(), stores()
+    req = request()
+    raw = approve(first_store, req, raw=req.actor.organization_id)
+    connector = WriteConnector()
+    first, _ = build_service(first_store, req, connector=connector)
+    second, _ = build_service(second_store, req, connector=connector)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda svc: execute(svc, req, raw), (first, second)))
+    assert any(result.status == "success" for result in results)
+    assert all(result.status == "success" or result.error.code == "OUTCOME_UNKNOWN" for result in results)
+    assert connector.calls == 1
+    assert execute(second, req, raw).status == "success"
+    assert connector.calls == 1
+
+
+def test_completion_ack_lost_returns_unknown_then_recovers_stored_success(stores, monkeypatch):
+    store = stores()
+    req = request()
+    raw = approve(store, req, raw=req.actor.organization_id)
+    svc, connector = build_service(store, req)
+    real_complete = store.complete_receipt
+    def lost_ack(*args, **kwargs):
+        real_complete(*args, **kwargs)
+        raise ConnectionError("lost result acknowledgement")
+    monkeypatch.setattr(store, "complete_receipt", lost_ack)
+    assert execute(svc, req, raw).error.code == "OUTCOME_UNKNOWN"
+    assert execute(svc, req, raw).status == "success"
+    assert connector.calls == 1
+
+
+def test_expiry_between_preparation_and_dispatch_blocks_execution(stores, monkeypatch):
+    store = stores()
+    req = request()
+    raw = approve(store, req, raw=req.actor.organization_id)
+    svc, connector = build_service(store, req)
+    real_prepare = store.prepare_receipt
+    now = utc_now()
+    def expire_after_prepare(intent):
+        receipt = real_prepare(intent)
+        monkeypatch.setattr("universal_connection_service.receipt_store.utc_now", lambda: now + timedelta(days=1))
+        return receipt
+    monkeypatch.setattr(store, "prepare_receipt", expire_after_prepare)
+    assert execute(svc, req, raw).error.code == "APPROVAL_EXPIRED"
     assert connector.calls == 0

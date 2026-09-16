@@ -192,6 +192,13 @@ class DurableExecutor:
             if dispatched or (dispatch_started and not isinstance(exc, ReceiptError)):
                 return self._error(req, "OUTCOME_UNKNOWN", receipt, unknown=True)
             code = exc.code if isinstance(exc, ReceiptError) else "RECEIPT_STORE_UNAVAILABLE"
+            if code in {"RECEIPT_STATE_CONFLICT", "APPROVAL_ALREADY_USED", "APPROVAL_UNAVAILABLE"} and receipt is not None:
+                try:
+                    current = self.store.get_receipt(receipt.organization_id, receipt.operation_id)
+                    if current is not None and current.state != "prepared":
+                        return self._cached(req, current)
+                except Exception:
+                    return self._error(req, "OUTCOME_UNKNOWN", receipt, unknown=True)
             return self._error(req, code, receipt)
 
 
