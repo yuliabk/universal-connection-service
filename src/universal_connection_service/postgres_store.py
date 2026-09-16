@@ -14,11 +14,13 @@ from .contracts import ConnectorManifest, Lifecycle, Model
 from .persistence import (
     AuditEvent,
     AuditStore,
+    ConnectionWorkflowRecord,
     ConnectorStateRecord,
     ConnectorStateStore,
     EvidenceKind,
     EvidenceRecord,
     EvidenceStore,
+    WorkflowStore,
 )
 
 try:  # optional production dependency
@@ -129,6 +131,39 @@ _MIGRATIONS = (
             "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
         ),
     ),
+    Migration(
+        3,
+        "resumable_connection_workflows",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS ucs_internal.connection_workflow (
+                workflow_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                service_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                selected_candidate_id TEXT,
+                selected_tool TEXT,
+                connector_id TEXT,
+                connector_version TEXT,
+                promotion_id TEXT,
+                last_code TEXT,
+                result_audit_id TEXT,
+                revision INTEGER NOT NULL DEFAULT 0,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                UNIQUE (organization_id, request_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_ucs_workflow_org_stage ON ucs_internal.connection_workflow (organization_id, stage, updated_at)",
+            "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = _MIGRATIONS[-1].version
@@ -162,13 +197,8 @@ class PostgresStoreConfig(Model):
         return value
 
 
-class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore):
-    """PostgreSQL/Supabase implementation of UCS persistent control-plane state.
-
-    The DSN is always kept as SecretStr. Prepared statements are disabled to
-    remain compatible with transaction poolers such as Supavisor/PgBouncer.
-    The internal schema is not intended to be exposed through the Supabase Data API.
-    """
+class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore, WorkflowStore):
+    """PostgreSQL/Supabase implementation of UCS persistent control-plane state."""
 
     def __init__(self, config: PostgresStoreConfig) -> None:
         if ConnectionPool is None or conninfo_to_dict is None or dict_row is None:
@@ -257,6 +287,31 @@ class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, Approva
         if value is None or isinstance(value, datetime):
             return value
         return datetime.fromisoformat(value)
+
+    @classmethod
+    def _workflow_from_row(cls, row: dict[str, Any]) -> ConnectionWorkflowRecord:
+        return ConnectionWorkflowRecord(
+            workflowId=row["workflow_id"],
+            requestId=row["request_id"],
+            organizationId=row["organization_id"],
+            requestFingerprint=row["request_fingerprint"],
+            serviceId=row["service_id"],
+            capability=row["capability"],
+            operation=row["operation"],
+            stage=row["stage"],
+            selectedCandidateId=row["selected_candidate_id"],
+            selectedTool=row["selected_tool"],
+            connectorId=row["connector_id"],
+            connectorVersion=row["connector_version"],
+            promotionId=row["promotion_id"],
+            lastCode=row["last_code"],
+            resultAuditId=row["result_audit_id"],
+            revision=row["revision"],
+            leaseToken=row["lease_token"],
+            leaseExpiresAt=cls._dt(row["lease_expires_at"]),
+            createdAt=cls._dt(row["created_at"]),
+            updatedAt=cls._dt(row["updated_at"]),
+        )
 
     def upsert_connector(self, record: ConnectorStateRecord) -> None:
         manifest_json = self._json(record.manifest.model_dump(by_alias=True, mode="json"))
@@ -498,6 +553,125 @@ class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, Approva
                 (consumed_at, approval_ref_hash, consumed_at),
             )
             return cursor.rowcount == 1
+
+    def create_workflow(self, record: ConnectionWorkflowRecord) -> ConnectionWorkflowRecord:
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ucs_internal.connection_workflow (
+                    workflow_id, request_id, organization_id, request_fingerprint,
+                    service_id, capability, operation, stage, selected_candidate_id,
+                    selected_tool, connector_id, connector_version, promotion_id,
+                    last_code, result_audit_id, revision, lease_token,
+                    lease_expires_at, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s)
+                """,
+                (
+                    record.workflow_id,
+                    record.request_id,
+                    record.organization_id,
+                    record.request_fingerprint,
+                    record.service_id,
+                    record.capability,
+                    record.operation,
+                    record.stage,
+                    record.selected_candidate_id,
+                    record.selected_tool,
+                    record.connector_id,
+                    record.connector_version,
+                    record.promotion_id,
+                    record.last_code,
+                    record.result_audit_id,
+                    record.revision,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+        created = self.get_workflow(record.organization_id, record.workflow_id)
+        assert created is not None
+        return created
+
+    def get_workflow(self, organization_id: str, workflow_id: str) -> ConnectionWorkflowRecord | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM ucs_internal.connection_workflow WHERE organization_id = %s AND workflow_id = %s",
+                (organization_id, workflow_id),
+            ).fetchone()
+        return self._workflow_from_row(row) if row is not None else None
+
+    def get_workflow_by_request(self, organization_id: str, request_id: str) -> ConnectionWorkflowRecord | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM ucs_internal.connection_workflow WHERE organization_id = %s AND request_id = %s",
+                (organization_id, request_id),
+            ).fetchone()
+        return self._workflow_from_row(row) if row is not None else None
+
+    def claim_workflow(
+        self,
+        organization_id: str,
+        workflow_id: str,
+        lease_token: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> bool:
+        with self._pool.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ucs_internal.connection_workflow
+                SET lease_token = %s, lease_expires_at = %s
+                WHERE organization_id = %s AND workflow_id = %s
+                  AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= %s)
+                """,
+                (lease_token, lease_expires_at, organization_id, workflow_id, now),
+            )
+            return cursor.rowcount == 1
+
+    def update_claimed_workflow(
+        self,
+        record: ConnectionWorkflowRecord,
+        *,
+        expected_revision: int,
+        lease_token: str,
+    ) -> bool:
+        with self._pool.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ucs_internal.connection_workflow
+                SET stage = %s, selected_candidate_id = %s, selected_tool = %s,
+                    connector_id = %s, connector_version = %s, promotion_id = %s,
+                    last_code = %s, result_audit_id = %s, revision = revision + 1,
+                    lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+                WHERE organization_id = %s AND workflow_id = %s
+                  AND revision = %s AND lease_token = %s
+                """,
+                (
+                    record.stage,
+                    record.selected_candidate_id,
+                    record.selected_tool,
+                    record.connector_id,
+                    record.connector_version,
+                    record.promotion_id,
+                    record.last_code,
+                    record.result_audit_id,
+                    record.organization_id,
+                    record.workflow_id,
+                    expected_revision,
+                    lease_token,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def release_workflow(self, organization_id: str, workflow_id: str, lease_token: str) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE ucs_internal.connection_workflow
+                SET lease_token = NULL, lease_expires_at = NULL
+                WHERE organization_id = %s AND workflow_id = %s AND lease_token = %s
+                """,
+                (organization_id, workflow_id, lease_token),
+            )
 
 
 def config_from_env(*, auto_migrate: bool | None = None) -> PostgresStoreConfig:
