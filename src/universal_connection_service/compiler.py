@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from .contracts import AuthRequirement, ConnectionPlan, ConnectionRequest
+from .discovery import DiscoveryEngine, DiscoveryQuery
 from .persistence import EvidenceRecord, EvidenceStore
 from .policy import DefaultPolicyEngine, PolicyEngine, PolicyFacts
 from .registry import ConnectorRegistry
@@ -12,10 +13,12 @@ class ConnectionCompiler:
         registry: ConnectorRegistry,
         policy_engine: PolicyEngine | None = None,
         evidence_store: EvidenceStore | None = None,
+        discovery_engine: DiscoveryEngine | None = None,
     ):
         self.registry = registry
         self.policy_engine = policy_engine or DefaultPolicyEngine()
         self.evidence_store = evidence_store
+        self.discovery_engine = discovery_engine
 
     @staticmethod
     def service_id(req: ConnectionRequest) -> str:
@@ -69,6 +72,38 @@ class ConnectionCompiler:
             )
         )
 
+    def _discover(self, req: ConnectionRequest, *, phase: str):
+        # Discovery is a planning concern only. Execution must never consult an
+        # external registry to decide what implementation should run.
+        if phase != "plan" or self.discovery_engine is None:
+            return (), None, False
+        candidates = self.discovery_engine.discover(
+            DiscoveryQuery(
+                serviceId=self.service_id(req),
+                serviceName=req.service.name,
+                capability=req.capability,
+            )
+        )
+        selected, requires_selection = self.discovery_engine.select(candidates)
+        if self.evidence_store is not None and candidates:
+            self.evidence_store.append_evidence(
+                EvidenceRecord(
+                    evidenceId=str(uuid4()),
+                    organizationId=req.actor.organization_id,
+                    kind="validation",
+                    phase="plan",
+                    requestId=req.request_id,
+                    payload={
+                        "type": "discovery",
+                        "sources": sorted({candidate.source for candidate in candidates}),
+                        "candidateIds": [candidate.candidate_id for candidate in candidates],
+                        "selectedCandidateId": selected.candidate_id if selected else None,
+                        "requiresSelection": requires_selection,
+                    },
+                )
+            )
+        return candidates, selected, requires_selection
+
     def compile(self, req: ConnectionRequest, *, phase: str = "plan") -> ConnectionPlan:
         if phase not in {"plan", "execution"}:
             raise ValueError("policy evidence phase must be plan or execution")
@@ -106,6 +141,44 @@ class ConnectionCompiler:
                 policyReasons=evaluation.reasons,
             )
 
+        candidates, selected, requires_selection = self._discover(req, phase=phase)
+        if selected is not None:
+            return ConnectionPlan(
+                planId=str(uuid4()),
+                requestId=req.request_id,
+                serviceId=service_id,
+                capability=req.capability,
+                strategy=selected.strategy,
+                authRequirement=selected.auth_requirement,
+                risk=evaluation.risk,
+                requiresBuild=selected.requires_build,
+                requiresValidation=True,
+                requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
+                policyDecision=evaluation.decision,
+                policyReasons=evaluation.reasons,
+                discoveryCandidates=candidates,
+                selectedDiscoveryCandidateId=selected.candidate_id,
+                requiresSelection=False,
+            )
+
+        if candidates and requires_selection:
+            return ConnectionPlan(
+                planId=str(uuid4()),
+                requestId=req.request_id,
+                serviceId=service_id,
+                capability=req.capability,
+                strategy=candidates[0].strategy,
+                authRequirement=AuthRequirement(type="other"),
+                risk=evaluation.risk,
+                requiresBuild=all(candidate.requires_build for candidate in candidates),
+                requiresValidation=True,
+                requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
+                policyDecision=evaluation.decision,
+                policyReasons=evaluation.reasons,
+                discoveryCandidates=candidates,
+                requiresSelection=True,
+            )
+
         strategy = "official_api" if req.service.base_url else "generated_api_adapter"
         return ConnectionPlan(
             planId=str(uuid4()),
@@ -120,4 +193,5 @@ class ConnectionCompiler:
             requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
             policyDecision=evaluation.decision,
             policyReasons=evaluation.reasons,
+            discoveryCandidates=candidates,
         )
