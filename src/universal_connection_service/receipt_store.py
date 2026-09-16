@@ -167,6 +167,21 @@ class SQLReceiptStore:
             self._save(conn, receipt, expected_version)
             return receipt
 
+    def begin_receipt_lookup(self, organization_id: str, operation_id: str, expected_version: int,
+                             contract_digest: str, max_lookups: int, deadline: datetime) -> ExecutionReceipt:
+        with self._receipt_transaction() as conn:
+            receipt = self._expected(conn, organization_id, operation_id, expected_version, {"dispatching", "unknown", "pending"})
+            if not contract_digest or receipt.recovery_contract_digest != contract_digest:
+                raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
+            if utc_now() >= deadline or receipt.lookup_count >= max_lookups:
+                raise ReceiptError("RECOVERY_BUDGET_EXHAUSTED")
+            receipt.lookup_count += 1
+            # Fence a late execution response; lookup completion uses this version.
+            if receipt.state == "dispatching":
+                receipt.state = "unknown"
+            self._save(conn, receipt, expected_version)
+            return receipt
+
     def complete_receipt(self, organization_id: str, operation_id: str, expected_version: int, state: Literal["succeeded", "failed_no_effect"], *, result_ref: str | None = None, provider_reference: str | None = None, result_ciphertext: str | None = None) -> ExecutionReceipt:
         """Called only with authoritative outcome evidence by the trusted coordinator.
 

@@ -110,3 +110,17 @@ worker של retention סורק עד 10 תוצאות סופיות בכל סבב, 
 מחיקת ciphertext המדויק וסימון resultPurgedAt ב־receipt נעשים באותה טרנזקציה עם CAS. receipt סופית, operationId, binding ו־outbox נשמרים. ניסיון חוזר מחזיר RESULT_EXPIRED עם executionState=succeeded, ללא הפעלת המחבר. אין מחיקת receipt או שחרור מפתח. expiry חוסם קריאה מיד; ניקוי האחסון מתבצע בהדרגה וזמנו תלוי במספר התוצאות ובזמינות worker/keyring. זהו DELETE ממסד הנתונים הפעיל, לא הבטחת מחיקה מעותקי גיבוי, WAL או שטחי דיסק פנויים; לפריסה נדרשת מדיניות retention נפרדת עבורם.
 
 בדיקות משותפות ל־SQLite/PostgreSQL מכסות מחיקה אחרי expiry, פתיחה מחדש ללא ביצוע חוזר, שמירת audit, מפתח חסר, תוצאה שלא פג תוקפה, tenant scope, ciphertext mismatch, rollback של מחיקה ב־CAS conflict ושני workers שמוחקים פעם אחת. מקומית עברו 27 בדיקות retention/durable execution ו־25 בדיקות PostgreSQL דולגו. G3 עדיין פתוח: recovery מאומת מול ספק ו־restore quarantine.
+
+### G3 — בירור ספק לפי מפתח מהניסיון הראשון
+
+ExecutionTarget יכול להגדיר `recovery` עם contractId, revision, evidenceSha256, approvalReference, lookupWindowSeconds, maxLookups ו־lookupTimeoutMs. זהו חוזה שהמפעיל אישר וקיבע לתוצאת אימות ספק; אין להסיק אותו מ־MCP annotations או להפיקו מהמודל. המתאם המהימן חייב להחזיר בדיוק את digest החוזה ולהטמיע `execute_keyed` ו־`lookup_execution` בהתאם לראיות. לא נוספה תצורה מאושרת לספק Production כלשהו.
+
+digest החוזה נשמר בכוונה לפני dispatch. הקריאה הראשונה למתאם מקבלת ProviderExecutionKey עם providerKey, חשבון ספק, bindingDigest ו־contractDigest. גרסת connector והחוזה נבדקים שוב לפני lookup. receipts ישנות ללא digest אינן מקבלות יכולת בירור רק באמצעות שינוי תצורה. ההרחבה נשמרת ב־receipt JSON עם defaults תואמי G2 ואינה מחייבת שינוי טבלאות.
+
+`POST /v1/control-plane/executions/reconcile` מקבל request ו־context, מחייב bearer בעל scope `executions:reconcile` לארגון, ואז מפעיל שוב בדיקות policy/context/actor/account/binding של ConnectionService. ה־scope מסמיך מפעיל לבצע בירור בשם actor מורשה ב־target; הוא אינו מסמיך dispatch חדש. אישור עסקי חדש אינו נדרש לקריאת תוצאה. אין קריאה למחבר עסקי ב־endpoint זה, גם כאשר receipt חסרה או prepared.
+
+לפני כל lookup נצרך מונה עמיד תחת CAS, כך שגם קריסה או timeout צורכים תקציב. החלון נספר מיצירת הכוונה (גבול שמרני), וה־timeout מוגבל גם לחלון וגם ל־deadline של הבקשה. pending נשאר pending; not_found ו־unknown נשארים unknown. success מחייב תוצאה סופית. failed_no_effect מחייב בנוסף חוזה שהניסיון הישן לא יוכל לבצע בעתיד (`lateExecutionPrevented`); HTTP error לבדו אינו ראיה לכך. כל תשובה חייבת להתאים לכל ארבעת שדות המפתח, ונבדקת שוב גם אם המתאם החזיר model שניתן לשינוי.
+
+תוצאה סופית נשמרת עם ciphertext ו־audit outbox באותה טרנזקציה. lookup מאוחר אינו יכול לדרוס receipt שהושלמה על ידי עובד אחר. בדיקת subprocess חדשה מבצעת commit במסד ספק סינתטי נפרד ואז os._exit(42); הפעלה מחדש מבצעת lookup לפי המפתח המקורי, שומרת succeeded ומשאירה אפקט ספק יחיד. בדיקות נוספות מכסות budget לאורך restart, not_found/pending/unknown, mismatch בחשבון, actor לא מורשה, scope/tenant של ה־endpoint, פקיעת חלון וחסימת recovery רטרואקטיבי ל־G2.
+
+נותרו במסגרת G3/G4: replay עסקי תחת חוזה deduplication ובדיקות אישור, restore quarantine, כיסוי תחרות/late workers ו־timeouts עמידים לביטול, והוכחת סיווג effects מהימן לכל המתאמים. מסלול lookup הסינתטי אינו הוכחת חוזה לספק Production.

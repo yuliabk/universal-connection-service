@@ -17,6 +17,7 @@ from pydantic import Field
 from .approvals import approval_ref_hash
 from .contracts import ConnectionError, ConnectionRequest, ConnectionResult, ConnectorResult, Model, Operation
 from .receipts import ExecutionIntent, ReceiptError, execution_binding, utc_now
+from .recovery import RecoveryContract, ProviderExecutionKey, ProviderOutcome
 
 
 class ExecutionTarget(Model):
@@ -34,6 +35,7 @@ class ExecutionTarget(Model):
     allow_no_credentials: bool = Field(alias="allowNoCredentials", default=False)
     success_is_final: bool = Field(alias="successIsFinal", default=False)
     result_retention_seconds: int = Field(alias="resultRetentionSeconds", ge=1, le=31_536_000)
+    recovery: RecoveryContract | None = None
 
 
 class ResultCipher:
@@ -146,7 +148,67 @@ class DurableExecutor:
         except ReceiptError as exc:
             return self._error(req, exc.code, receipt)
 
-    async def execute(self, req, ctx, registration, *, allow_dispatch=True):
+    @staticmethod
+    def _recovery_contract(target, registration):
+        if target.recovery is None:
+            raise ReceiptError("RECOVERY_NOT_CONFIGURED")
+        connector = registration.connector
+        if ((registration.manifest.connector_id, registration.manifest.version) !=
+                (target.connector_id, target.connector_version) or
+                not callable(getattr(connector, "recovery_contract_digest", None)) or
+                connector.recovery_contract_digest() != target.recovery.digest() or
+                not callable(getattr(connector, "execute_keyed", None)) or
+                not callable(getattr(connector, "lookup_execution", None))):
+            raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
+        return target.recovery
+
+    @staticmethod
+    def _provider_key(receipt):
+        return ProviderExecutionKey(providerKey=receipt.provider_key,
+            providerAccountId=receipt.provider_account_id, bindingDigest=receipt.binding_digest,
+            contractDigest=receipt.recovery_contract_digest)
+
+    async def _reconcile(self, req, ctx, registration, target, receipt):
+        contract = self._recovery_contract(target, registration)
+        if (receipt.recovery_contract_digest != contract.digest() or
+            (receipt.connector_id, receipt.connector_version) != (target.connector_id, target.connector_version)):
+            raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
+        deadline = receipt.created_at + timedelta(seconds=contract.lookup_window_seconds)
+        receipt = self.store.begin_receipt_lookup(receipt.organization_id, receipt.operation_id,
+            receipt.version, contract.digest(), contract.max_lookups, deadline)
+        key = self._provider_key(receipt)
+        try:
+            timeout = min(ctx.deadline_ms, contract.lookup_timeout_ms) / 1000
+            timeout = min(timeout, (deadline - utc_now()).total_seconds())
+            if timeout <= 0:
+                raise ReceiptError("RECOVERY_BUDGET_EXHAUSTED")
+            outcome = await asyncio.wait_for(registration.connector.lookup_execution(
+                req.capability, ctx.model_copy(deep=True), key.model_copy(deep=True)), timeout=timeout)
+            if isinstance(outcome, ProviderOutcome):
+                # Revalidate even a model instance: adapter code could mutate it.
+                outcome = ProviderOutcome.model_validate(outcome.model_dump())
+            if (not isinstance(outcome, ProviderOutcome) or any(getattr(outcome, name) != value
+                    for name, value in key.model_dump().items())):
+                raise ReceiptError("RECOVERY_OUTCOME_MISMATCH")
+            if outcome.state in {"unknown", "not_found", "pending"}:
+                receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id,
+                    receipt.version, "pending" if outcome.state == "pending" else "unknown")
+            else:
+                sealed = self.cipher.seal(receipt, outcome.result, target.result_retention_seconds)
+                receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id,
+                    receipt.version, outcome.state, result_ciphertext=sealed)
+            return self._cached(req, receipt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A competing lookup may have completed; never execute to recover.
+            current = self.store.get_receipt(receipt.organization_id, receipt.operation_id)
+            if current and current.state in {"succeeded", "failed_no_effect"}:
+                return self._cached(req, current)
+            return self._error(req, exc.code if isinstance(exc, ReceiptError) else "OUTCOME_UNKNOWN",
+                current or receipt)
+
+    async def execute(self, req, ctx, registration, *, allow_dispatch=True, reconcile=False):
         receipt = None
         dispatched = False
         dispatch_started = False
@@ -171,8 +233,10 @@ class DurableExecutor:
                 if receipt.binding_digest != digest:
                     raise ReceiptError("IDEMPOTENCY_CONFLICT")
                 if receipt.state != "prepared":
+                    if reconcile and receipt.state not in {"succeeded", "failed_no_effect"}:
+                        return await self._reconcile(req, ctx, registration, target, receipt)
                     return self._cached(req, receipt)
-            if not allow_dispatch:
+            if not allow_dispatch or reconcile:
                 return self._error(req, "RECEIPT_NOT_DISPATCHED", receipt)
             if (registration.manifest.connector_id, registration.manifest.version) != (target.connector_id, target.connector_version):
                 raise ReceiptError("EXECUTION_CONNECTOR_MISMATCH")
@@ -180,22 +244,28 @@ class DurableExecutor:
                 raise ReceiptError("APPROVAL_REQUIRED")
             if not target.success_is_final:
                 raise ReceiptError("EXECUTION_OUTCOME_CONTRACT_REQUIRED")
+            contract = self._recovery_contract(target, registration) if target.recovery else None
             intent = ExecutionIntent(organizationId=req.actor.organization_id, operationId=req.operation_id,
                 requestId=req.request_id, userId=req.actor.user_id, agentId=req.actor.agent_id,
                 serviceId=target.service_id, providerAccountId=target.provider_account_id, capability=req.capability,
                 operation=req.operation, bindingDigest=digest, connectorId=target.connector_id,
-                connectorVersion=target.connector_version, approvalRefHash=approval_ref_hash(ctx.approval_id))
+                connectorVersion=target.connector_version, approvalRefHash=approval_ref_hash(ctx.approval_id),
+                recoveryContractDigest=contract.digest() if contract else None)
             receipt = self.store.prepare_receipt(intent)
             if receipt.state != "prepared":
                 return self._cached(req, receipt)
+            if receipt.recovery_contract_digest != (contract.digest() if contract else None):
+                raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
             dispatch_started = True
             receipt = self.store.begin_dispatch(receipt.organization_id, receipt.operation_id, receipt.version,
                                                 req.request_id, require_approval=True,
                                                 approval_ref_hash=approval_ref_hash(ctx.approval_id))
             dispatched = True
             # Context is copied so caller mutation cannot affect the dispatched request.
-            result = await asyncio.wait_for(registration.connector.execute(req.capability, req.model_copy(deep=True).input,
-                                            ctx.model_copy(deep=True)), timeout=ctx.deadline_ms / 1000)
+            call = (registration.connector.execute_keyed(req.capability, req.model_copy(deep=True).input,
+                    ctx.model_copy(deep=True), self._provider_key(receipt)) if contract else
+                    registration.connector.execute(req.capability, req.model_copy(deep=True).input, ctx.model_copy(deep=True)))
+            result = await asyncio.wait_for(call, timeout=ctx.deadline_ms / 1000)
             if not isinstance(result, ConnectorResult) or result.status != "success":
                 receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id, receipt.version, "unknown")
                 return self._error(req, "OUTCOME_UNKNOWN", receipt)

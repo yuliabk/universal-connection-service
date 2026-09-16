@@ -66,6 +66,7 @@ class ExecutionIntent(Model):
     connector_id: str = Field(alias="connectorId", min_length=1)
     connector_version: str = Field(alias="connectorVersion", min_length=1)
     approval_ref_hash: str | None = Field(alias="approvalRefHash", default=None, pattern=r"^[a-f0-9]{64}$")
+    recovery_contract_digest: str | None = Field(alias="recoveryContractDigest", default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class ExecutionReceipt(ExecutionIntent):
@@ -74,6 +75,7 @@ class ExecutionReceipt(ExecutionIntent):
     state: ReceiptState = "prepared"
     version: int = Field(default=0, ge=0)
     attempt_count: int = Field(alias="attemptCount", default=0, ge=0)
+    lookup_count: int = Field(alias="lookupCount", default=0, ge=0)
     attempt_id: str | None = Field(alias="attemptId", default=None)
     result_ref: str | None = Field(alias="resultRef", default=None)
     provider_reference: str | None = Field(alias="providerReference", default=None)
@@ -126,3 +128,4 @@ class ReceiptStore(Protocol):
     def deliver_receipt_audit(self, organization_id: str, limit: int = 100) -> int: ...
     def receipt_result_page(self, after: str = "", limit: int = 10) -> list[tuple[ExecutionReceipt, str]]: ...
     def purge_receipt_result(self, organization_id: str, operation_id: str, expected_version: int, ciphertext: str) -> bool: ...
+    def begin_receipt_lookup(self, organization_id: str, operation_id: str, expected_version: int, contract_digest: str, max_lookups: int, deadline: datetime) -> ExecutionReceipt: ...
