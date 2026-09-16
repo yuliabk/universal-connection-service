@@ -9,6 +9,24 @@ class ReconcileCommand(Model):
     context: ExecutionContext
 
 
+def build_connection_execution_router(service, authenticator):
+    router = APIRouter(prefix="/v1/connections", tags=["connections"])
+
+    @router.post("/execute", response_model=ConnectionResult)
+    async def execute(command: ReconcileCommand, authorization: str | None = Header(default=None)):
+        if authenticator is None:
+            raise HTTPException(503, detail={"code": "EXECUTION_AUTHENTICATION_UNAVAILABLE"})
+        principal = authenticator.authenticate(authorization)
+        if principal is None:
+            raise HTTPException(401, detail={"code": "EXECUTION_UNAUTHENTICATED"},
+                headers={"WWW-Authenticate": "Bearer"})
+        if not principal.allows_execution(command.request.actor):
+            raise HTTPException(403, detail={"code": "EXECUTION_ACTOR_FORBIDDEN"})
+        return await service.execute(command.request, command.context)
+
+    return router
+
+
 def build_execution_router(service, authenticator):
     router = APIRouter(prefix="/v1/control-plane/executions", tags=["executions"])
 

@@ -309,7 +309,7 @@ class AutoConnectOrchestrator:
         if trusted is not None:
             record.connector_id = trusted.manifest.connector_id
             record.connector_version = trusted.manifest.version
-            return await self._drive_execution(record, command, plan)
+            return await self._drive_execution(principal, record, command, plan)
 
         if record.stage == "awaiting_reconciliation":
             record.last_code = "CONNECTION_UNAVAILABLE"
@@ -383,11 +383,14 @@ class AutoConnectOrchestrator:
 
     async def _drive_execution(
         self,
+        principal: ControlPlanePrincipal,
         record: ConnectionWorkflowRecord,
         command: AutoConnectAdvanceCommand,
         plan: ConnectionPlan,
     ) -> AutoConnectResponse:
         request = command.request
+        if command.execute_when_ready and not principal.allows_execution(request.actor):
+            raise AutoConnectError("EXECUTION_ACTOR_FORBIDDEN", "Principal cannot execute as this actor", status_code=403)
         if plan.auth_requirement.type != "none" and command.credential_handle is None:
             record.stage = "awaiting_credentials"
             record.last_code = "CREDENTIAL_HANDLE_REQUIRED"

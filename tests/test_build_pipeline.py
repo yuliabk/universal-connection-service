@@ -68,7 +68,8 @@ def principal(*scopes):
         subject="owner",
         tokenId="owner-token",
         organizations=("org-1",),
-        scopes=scopes,
+        scopes=scopes + ("connections:execute",),
+        executionActors=(ActorRef(userId="u1", organizationId="org-1", agentId="a1"),),
     )
 
 

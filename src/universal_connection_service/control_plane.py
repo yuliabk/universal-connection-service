@@ -12,7 +12,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import Field, SecretStr, field_validator
 
 from .approvals import ApprovalRecord, ApprovalStore, approval_ref_hash
-from .contracts import ConnectionRequest, ConnectorManifest, ExecutionContext, Model
+from .contracts import ActorRef, ConnectionRequest, ConnectorManifest, ExecutionContext, Model
 from .mcp_validation import MCPValidationReport, MCPValidationService
 from .persistence import ConnectorStateStore, EvidenceRecord, EvidenceStore
 from .registry import ConnectorRegistry, Registration
@@ -20,6 +20,7 @@ from .service import ConnectionService
 
 
 ControlPlaneScope = Literal[
+    "connections:execute",
     "executions:replay",
     "executions:reconcile",
     "connectors:review",
@@ -28,6 +29,7 @@ ControlPlaneScope = Literal[
     "connectors:promote",
 ]
 _ALLOWED_SCOPES = {
+    "connections:execute",
     "executions:replay",
     "executions:reconcile",
     "connectors:review",
@@ -44,6 +46,7 @@ class ControlPlaneCredential(Model):
     token_id: str = Field(alias="tokenId", min_length=1)
     organizations: tuple[str, ...] = Field(min_length=1)
     scopes: tuple[ControlPlaneScope, ...] = Field(min_length=1)
+    execution_actors: tuple[ActorRef, ...] = Field(alias="executionActors", default=())
 
     @field_validator("token_sha256")
     @classmethod
@@ -74,9 +77,13 @@ class ControlPlanePrincipal(Model):
     token_id: str = Field(alias="tokenId")
     organizations: tuple[str, ...]
     scopes: tuple[ControlPlaneScope, ...]
+    execution_actors: tuple[ActorRef, ...] = Field(alias="executionActors", default=())
 
     def allows(self, scope: ControlPlaneScope, organization_id: str) -> bool:
         return scope in self.scopes and ("*" in self.organizations or organization_id in self.organizations)
+
+    def allows_execution(self, actor: ActorRef) -> bool:
+        return self.allows("connections:execute", actor.organization_id) and actor in self.execution_actors
 
 
 class StaticBearerAuthenticator:
@@ -119,6 +126,7 @@ class StaticBearerAuthenticator:
             tokenId=match.token_id,
             organizations=match.organizations,
             scopes=match.scopes,
+            executionActors=match.execution_actors,
         )
 
 

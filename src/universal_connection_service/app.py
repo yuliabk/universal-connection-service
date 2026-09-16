@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from .approvals import ApprovalStore, PersistentApprovalVerifier
 from .receipt_audit import run_receipt_audit_worker
 from .receipt_retention import run_receipt_retention_worker
-from .execution_api import build_execution_router
+from .execution_api import build_execution_router, build_connection_execution_router
 from .auto_connect import build_auto_connect_router
 from .build_auto_connect import BuildAwareAutoConnectOrchestrator, VerifiedBuildCoordinator
 from .build_pipeline import (
@@ -441,6 +441,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Universal Connection Service", version="0.1.0", lifespan=lifespan)
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
 app.include_router(build_execution_router(service, control_plane_authenticator))
+app.include_router(build_connection_execution_router(service, control_plane_authenticator))
 app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_policy_auto_connect_router(policy_auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_sandbox_tool_policy_router(sandbox_policy_service, control_plane_authenticator))
@@ -480,8 +481,3 @@ def connectors():
 @app.post("/v1/connections/plan", response_model=ConnectionPlan)
 def plan(request: ConnectionRequest):
     return service.compiler.compile(request)
-
-
-@app.post("/v1/connections/execute", response_model=ConnectionResult)
-async def execute(request: ConnectionRequest, context: ExecutionContext):
-    return await service.execute(request, context)

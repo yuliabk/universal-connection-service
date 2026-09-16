@@ -76,12 +76,13 @@ def records_read() -> dict:
     return {"ok": True}
 
 
-def principal(*scopes):
+def principal(*scopes, execution=True):
     return ControlPlanePrincipal(
         subject="owner",
         tokenId="owner-token",
         organizations=("org-1",),
-        scopes=scopes,
+        scopes=scopes + (("connections:execute",) if execution else ()),
+        executionActors=(ActorRef(userId="u1", organizationId="org-1", agentId="a1"),) if execution else (),
     )
 
 
@@ -354,6 +355,26 @@ def test_workflow_lease_is_atomic_and_can_be_reclaimed_after_expiry():
     assert store.claim_workflow("org-1", record.workflow_id, "lease-b", now + timedelta(seconds=10), now) is False
     later = now + timedelta(seconds=11)
     assert store.claim_workflow("org-1", record.workflow_id, "lease-c", later + timedelta(seconds=10), later) is True
+    store.close()
+
+
+def test_metadata_reviewer_cannot_execute_or_resume_as_an_ungranted_actor():
+    connector = StubConnector()
+    store, _, _, _, orchestrator = stack(trusted=connector)
+    reviewer = principal("connectors:review", execution=False)
+    req = request()
+    preview = asyncio.run(orchestrator.start(reviewer,
+        AutoConnectStartCommand(request=req, executeWhenReady=False)))
+    assert preview.workflow.stage == "ready_to_execute"
+    with pytest.raises(AutoConnectError) as error:
+        asyncio.run(orchestrator.advance(reviewer, preview.workflow.workflow_id,
+            AutoConnectAdvanceCommand(request=req)))
+    assert error.value.code == "EXECUTION_ACTOR_FORBIDDEN"
+    assert connector.calls == 0
+    completed = asyncio.run(orchestrator.advance(principal("connectors:review"), preview.workflow.workflow_id,
+        AutoConnectAdvanceCommand(request=req)))
+    assert completed.result.status == "success"
+    assert connector.calls == 1
     store.close()
 
 

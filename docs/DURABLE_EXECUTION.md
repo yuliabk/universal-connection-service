@@ -163,3 +163,13 @@ DurableExecutor מחייב כעת DispatchWitness במסד נתונים נפרד
 בדיקות בשני backends כוללות מחבר שבולע CancelledError וממשיך להמתין: הבקשה חוזרת בזמן, retry רגיל אינו מפעיל מחבר נוסף, והצלחה מאוחרת אינה נשמרת. בדיקת lookup נוספת משלימה receipt באמצעות בירור שני ואז משחררת תשובת כישלון מאוחרת מהבירור הראשון; התוצאה הסופית ואירוע ה־audit נשארים ללא שינוי. נבדקים גם מיצוי קיבולת, שחרורה לאחר סיום משימה וצריכת שגיאה מאוחרת.
 
 גבול המנגנון הוא event loop פעיל. קוד Python שחוסם את ה־thread בלי yielding אינו ניתן לעצירה בטוחה באמצעות asyncio; מתאמים לא מהימנים חייבים להמשיך לרוץ בגבול התהליך/הסנדבוקס הקיים עם השגחת runtime. כיבוי תהליך אינו הוכחה לאי־ביצוע מרוחק. סיווג effects מהימן וביקורת הדרישות המלאה עדיין פתוחים.
+
+### G4 — אימות actor בגבול HTTP וב־auto-connect
+
+בביקורת נמצא ש־`POST /v1/connections/execute` הסתפק בהתאמה בין request.actor לבין context שנשלחו שניהם על ידי הקורא. המסלול דורש כעת bearer מאומת מתוך `UCS_CONTROL_PLANE_CREDENTIALS_JSON`, scope `connections:execute`, הרשאה לארגון ו־`executionActors` עם צירופים מפורשים של organizationId/userId/agentId. אין מכפלה של רשימות משתמשים וסוכנים ואין הסקת זהות משדות הבקשה. metadata token ללא executionActors אינו מורשה לבצע פעולות או לקרוא תוצאות receipt שמורות.
+
+למשל, רשומת credential יכולה לכלול `"scopes":["connections:execute"]` ו־`"executionActors":[{"organizationId":"synthetic-org","userId":"synthetic-user","agentId":"synthetic-agent"}]`, לצד tokenSha256, tokenId, subject ו־organizations הקיימים. נשמר רק hash של הטוקן בתצורת האימות. endpoint ללא authenticator מחזיר 503; טוקן חסר/שגוי מחזיר 401; scope/ארגון/actor לא מורשים מחזירים 403 לפני כניסה לשירות. אישור עסקי לביצוע חדש עדיין נדרש בנפרד.
+
+auto-connect מחייב אותה הרשאת actor לפני dispatch או קריאת receipt קיימת. `connectors:review` ממשיך להספיק לצפייה בתכנון ובסטטוס, אך אינו מסמיך executeWhenReady. הרשאות מפעיל `executions:reconcile` ו־`executions:replay` נשארות הרשאות האצלה נפרדות ומפורשות ברמת הארגון, עם בדיקות target/actor/account ואישור replay המקורי. פורט ConnectionService הפנימי ממשיך להניח שמארח ה־SDK אימת את זהות הקורא; גבולות HTTP המסופקים אוכפים זאת בעצמם.
+
+בדיקות API עם receipt אמיתית מוכיחות חסימת טוקן חסר, טוקן לארגון אחר, scope שגוי, actor חסר והתחזות לכל אחד משדות הזהות; רק הצירוף המאושר מקבל את התוצאה ללא dispatch נוסף. נבדקה גם חסימת עקיפה באמצעות workflow preview/advance עם הרשאת review בלבד. סיווג capability מהימן נותר סעיף נפרד להשלמה.

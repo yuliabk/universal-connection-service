@@ -52,7 +52,8 @@ class NoopValidationService: pass
 
 
 def principal(*scopes):
-    return ControlPlanePrincipal(subject="operator", tokenId="operator-token", organizations=("org-1",), scopes=scopes)
+    return ControlPlanePrincipal(subject="operator", tokenId="operator-token", organizations=("org-1",),
+        scopes=scopes + ("connections:execute",), executionActors=(ActorRef(userId="u1", organizationId="org-1", agentId="a1"),))
 
 
 def request(request_id="req-policy-1"):
