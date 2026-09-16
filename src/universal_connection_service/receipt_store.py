@@ -302,17 +302,20 @@ class SQLReceiptStore(ExecutionObservabilityStore):
                 """, (organization_id, limit)).fetchall()
             return [ReceiptAudit.model_validate_json(row["event_json"]) for row in rows]
 
-    def receipt_result_page(self, after: str = "", limit: int = 10) -> list[tuple[ExecutionReceipt, str]]:
-        """Host-only bounded scan, including legacy G2 encrypted envelopes."""
+    def receipt_result_page(self, after: str = "", limit: int = 10) -> list[tuple[str, str, str]]:
+        """Host-only raw scan: advance by the index even if a document is invalid.
+
+        The retention worker validates each document before considering deletion.
+        """
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
         with self._receipt_transaction() as conn:
-            rows = self._receipt_query(conn, """SELECT r.receipt_json, p.ciphertext
+            rows = self._receipt_query(conn, """SELECT r.receipt_id, r.receipt_json, p.ciphertext
                 FROM execution_receipt r JOIN execution_result p
                 ON r.organization_id = p.organization_id AND r.operation_id = p.operation_id
                 WHERE r.receipt_id > ? AND r.state IN ('succeeded', 'failed_no_effect')
                 ORDER BY r.receipt_id LIMIT ?""", (after, limit)).fetchall()
-            return [(ExecutionReceipt.model_validate_json(row["receipt_json"]), row["ciphertext"]) for row in rows]
+            return [(row["receipt_id"], row["receipt_json"], row["ciphertext"]) for row in rows]
 
     def purge_receipt_result(self, organization_id: str, operation_id: str, expected_version: int, ciphertext: str) -> bool:
         """Trusted retention worker calls only after authenticating envelope expiry.

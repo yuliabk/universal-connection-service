@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+import json
 
 import pytest
 
@@ -78,3 +79,31 @@ def test_purge_is_scoped_atomic_and_idempotent_between_workers(stores, monkeypat
             req.operation_id, receipt.version, ciphertext), [store, second]))
     assert sorted(results) == [False, True]
     assert stores().get_receipt(req.actor.organization_id, req.operation_id).state == "succeeded"
+
+
+@pytest.mark.parametrize("invalid_document", ["future_version", "invalid_json"])
+def test_invalid_receipt_cannot_starve_later_retention_pages(stores, monkeypatch, invalid_document):
+    store = stores()
+    executions = [expired_execution(store, monkeypatch) for _ in range(2)]
+    executions.sort(key=lambda item: item[3].receipt_id)
+    bad, good = executions
+    req, service, _, _ = bad
+    original = store.get_receipt(req.actor.organization_id, req.operation_id)
+    ciphertext = store.get_receipt_result(req.actor.organization_id, req.operation_id)
+    document = original.model_dump(mode="json", by_alias=True)
+    document["bindingSchemaVersion"] = 2
+    raw_document = json.dumps(document) if invalid_document == "future_version" else "{"
+    with store._receipt_transaction() as conn:
+        store._receipt_query(conn, "UPDATE execution_receipt SET receipt_json = ? WHERE organization_id = ? AND operation_id = ?",
+            (raw_document, req.actor.organization_id, req.operation_id))
+    page = store.receipt_result_page
+    monkeypatch.setattr(store, "receipt_result_page", lambda after="": page(after, limit=1))
+    scan(store, service.durable_executor.cipher)
+    assert store.get_receipt_result(req.actor.organization_id, req.operation_id) == ciphertext
+    good_req = good[0]
+    assert store.get_receipt_result(good_req.actor.organization_id, good_req.operation_id) is None
+    assert store.get_receipt(good_req.actor.organization_id, good_req.operation_id).result_purged_at is not None
+    with store._receipt_transaction() as conn:
+        row = store._receipt_query(conn, "SELECT receipt_json FROM execution_receipt WHERE organization_id = ? AND operation_id = ?",
+            (req.actor.organization_id, req.operation_id)).fetchone()
+    assert row["receipt_json"] == raw_document
