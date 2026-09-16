@@ -1,7 +1,11 @@
+from __future__ import annotations
+
+import hashlib
 from uuid import uuid4
 
 from .compiler import ConnectionCompiler
 from .contracts import ConnectionError, ConnectionRequest, ConnectionResult, ExecutionContext
+from .persistence import AuditEvent, AuditStore, EvidenceRecord, EvidenceStore
 from .policy import ApprovalVerifier, PolicyEngine
 from .registry import ConnectorRegistry
 
@@ -12,25 +16,19 @@ class ConnectionService:
         registry: ConnectorRegistry,
         policy_engine: PolicyEngine | None = None,
         approval_verifier: ApprovalVerifier | None = None,
+        *,
+        audit_store: AuditStore | None = None,
+        evidence_store: EvidenceStore | None = None,
     ):
         self.registry = registry
-        self.compiler = ConnectionCompiler(registry, policy_engine=policy_engine)
-        self.approval_verifier = approval_verifier
-
-    @staticmethod
-    def _failed(req: ConnectionRequest, service_id: str, code: str, message: str, *, user_action=False):
-        return ConnectionResult(
-            requestId=req.request_id,
-            status="failed",
-            serviceId=service_id,
-            capability=req.capability,
-            error=ConnectionError(
-                code=code,
-                message=message,
-                userActionRequired=user_action,
-            ),
-            auditId=str(uuid4()),
+        self.compiler = ConnectionCompiler(
+            registry,
+            policy_engine=policy_engine,
+            evidence_store=evidence_store,
         )
+        self.approval_verifier = approval_verifier
+        self.audit_store = audit_store
+        self.evidence_store = evidence_store
 
     @staticmethod
     def _context_matches(req: ConnectionRequest, ctx: ExecutionContext) -> bool:
@@ -38,6 +36,107 @@ class ConnectionService:
             ctx.request_id == req.request_id
             and ctx.user_id == req.actor.user_id
             and ctx.organization_id == req.actor.organization_id
+        )
+
+    @staticmethod
+    def _approval_ref_hash(approval_id: str | None) -> str | None:
+        if not approval_id:
+            return None
+        return hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
+
+    def _persist_approval_evidence(
+        self,
+        req: ConnectionRequest,
+        *,
+        connector_id: str | None,
+        approval_id: str | None,
+        valid: bool,
+        code: str,
+    ) -> None:
+        if self.evidence_store is None:
+            return
+        self.evidence_store.append_evidence(
+            EvidenceRecord(
+                evidenceId=str(uuid4()),
+                organizationId=req.actor.organization_id,
+                kind="approval_verification",
+                phase="execution",
+                requestId=req.request_id,
+                connectorId=connector_id,
+                payload={
+                    "approvalRefHash": self._approval_ref_hash(approval_id),
+                    "valid": valid,
+                    "code": code,
+                },
+            )
+        )
+
+    def _result(
+        self,
+        req: ConnectionRequest,
+        service_id: str,
+        *,
+        status: str,
+        connector_id: str | None = None,
+        data=None,
+        error: ConnectionError | None = None,
+        policy_decision: str | None = None,
+        approval_id: str | None = None,
+    ) -> ConnectionResult:
+        audit_id = str(uuid4())
+        if self.audit_store is not None:
+            self.audit_store.append_audit(
+                AuditEvent(
+                    auditId=audit_id,
+                    requestId=req.request_id,
+                    organizationId=req.actor.organization_id,
+                    userId=req.actor.user_id,
+                    agentId=req.actor.agent_id,
+                    serviceId=service_id,
+                    capability=req.capability,
+                    operation=req.operation,
+                    status=status,
+                    connectorId=connector_id,
+                    policyDecision=policy_decision,
+                    errorCode=error.code if error else None,
+                    approvalRefHash=self._approval_ref_hash(approval_id),
+                )
+            )
+        return ConnectionResult(
+            requestId=req.request_id,
+            status=status,
+            serviceId=service_id,
+            capability=req.capability,
+            connectorId=connector_id,
+            data=data,
+            error=error,
+            auditId=audit_id,
+        )
+
+    def _failed(
+        self,
+        req: ConnectionRequest,
+        service_id: str,
+        code: str,
+        message: str,
+        *,
+        user_action: bool = False,
+        connector_id: str | None = None,
+        policy_decision: str | None = None,
+        approval_id: str | None = None,
+    ) -> ConnectionResult:
+        return self._result(
+            req,
+            service_id,
+            status="failed",
+            connector_id=connector_id,
+            error=ConnectionError(
+                code=code,
+                message=message,
+                userActionRequired=user_action,
+            ),
+            policy_decision=policy_decision,
+            approval_id=approval_id,
         )
 
     async def execute(self, req: ConnectionRequest, ctx: ExecutionContext) -> ConnectionResult:
@@ -49,9 +148,10 @@ class ConnectionService:
                 "EXECUTION_CONTEXT_MISMATCH",
                 "Execution context does not match the connection request",
                 user_action=True,
+                approval_id=ctx.approval_id,
             )
 
-        plan = self.compiler.compile(req)
+        plan = self.compiler.compile(req, phase="execution")
         if plan.policy_decision == "DENY":
             return self._failed(
                 req,
@@ -59,6 +159,9 @@ class ConnectionService:
                 "POLICY_DENIED",
                 "Policy denied this connection request",
                 user_action=True,
+                connector_id=plan.connector_id,
+                policy_decision=plan.policy_decision,
+                approval_id=ctx.approval_id,
             )
 
         if not plan.connector_id:
@@ -68,67 +171,129 @@ class ConnectionService:
                 "CONNECTION_UNAVAILABLE",
                 "No trusted connector is available",
                 user_action=True,
+                policy_decision=plan.policy_decision,
+                approval_id=ctx.approval_id,
             )
 
         if plan.policy_decision == "REQUIRE_APPROVAL":
             if not ctx.approval_id:
+                self._persist_approval_evidence(
+                    req,
+                    connector_id=plan.connector_id,
+                    approval_id=None,
+                    valid=False,
+                    code="APPROVAL_REQUIRED",
+                )
                 return self._failed(
                     req,
                     plan.service_id,
                     "APPROVAL_REQUIRED",
                     "This operation requires human approval",
                     user_action=True,
+                    connector_id=plan.connector_id,
+                    policy_decision=plan.policy_decision,
                 )
             if self.approval_verifier is None:
+                self._persist_approval_evidence(
+                    req,
+                    connector_id=plan.connector_id,
+                    approval_id=ctx.approval_id,
+                    valid=False,
+                    code="APPROVAL_VERIFICATION_UNAVAILABLE",
+                )
                 return self._failed(
                     req,
                     plan.service_id,
                     "APPROVAL_VERIFICATION_UNAVAILABLE",
                     "Approval verification is not configured",
                     user_action=True,
+                    connector_id=plan.connector_id,
+                    policy_decision=plan.policy_decision,
+                    approval_id=ctx.approval_id,
                 )
             try:
                 verification = await self.approval_verifier.verify(ctx.approval_id, req)
             except Exception:
+                self._persist_approval_evidence(
+                    req,
+                    connector_id=plan.connector_id,
+                    approval_id=ctx.approval_id,
+                    valid=False,
+                    code="APPROVAL_VERIFICATION_UNAVAILABLE",
+                )
                 return self._failed(
                     req,
                     plan.service_id,
                     "APPROVAL_VERIFICATION_UNAVAILABLE",
                     "Approval verification failed",
                     user_action=True,
+                    connector_id=plan.connector_id,
+                    policy_decision=plan.policy_decision,
+                    approval_id=ctx.approval_id,
                 )
             if not verification.valid:
+                self._persist_approval_evidence(
+                    req,
+                    connector_id=plan.connector_id,
+                    approval_id=ctx.approval_id,
+                    valid=False,
+                    code=verification.code,
+                )
                 return self._failed(
                     req,
                     plan.service_id,
                     verification.code,
                     verification.message,
                     user_action=True,
+                    connector_id=plan.connector_id,
+                    policy_decision=plan.policy_decision,
+                    approval_id=ctx.approval_id,
                 )
             try:
                 # Approvals authorize one execution attempt. Consume before the
                 # outbound call to prevent concurrent replay of a valid grant.
                 await self.approval_verifier.consume(ctx.approval_id)
             except Exception:
+                self._persist_approval_evidence(
+                    req,
+                    connector_id=plan.connector_id,
+                    approval_id=ctx.approval_id,
+                    valid=False,
+                    code="APPROVAL_VERIFICATION_UNAVAILABLE",
+                )
                 return self._failed(
                     req,
                     plan.service_id,
                     "APPROVAL_VERIFICATION_UNAVAILABLE",
                     "Approval could not be consumed",
                     user_action=True,
+                    connector_id=plan.connector_id,
+                    policy_decision=plan.policy_decision,
+                    approval_id=ctx.approval_id,
                 )
+            self._persist_approval_evidence(
+                req,
+                connector_id=plan.connector_id,
+                approval_id=ctx.approval_id,
+                valid=True,
+                code="APPROVAL_CONSUMED",
+            )
 
-        item = self.registry.trusted(plan.service_id, req.capability)
+        item = self.registry.trusted(
+            plan.service_id,
+            req.capability,
+            req.actor.organization_id,
+        )
         if not item:
             raise RuntimeError("registry changed during execution")
         result = await item.connector.execute(req.capability, req.input, ctx)
-        return ConnectionResult(
-            requestId=req.request_id,
+        return self._result(
+            req,
+            plan.service_id,
             status=result.status,
-            serviceId=plan.service_id,
-            capability=req.capability,
-            connectorId=item.manifest.connector_id,
+            connector_id=item.manifest.connector_id,
             data=result.data,
             error=result.error,
-            auditId=str(uuid4()),
+            policy_decision=plan.policy_decision,
+            approval_id=ctx.approval_id,
         )

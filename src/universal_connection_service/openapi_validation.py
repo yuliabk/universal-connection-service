@@ -5,13 +5,15 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 from pydantic import Field
 
 from .contracts import Model
 from .openapi_adapter import _reject_remote_refs
+from .persistence import EvidenceRecord, EvidenceStore
 from .registry import Registration
 
 try:
@@ -164,8 +166,39 @@ class SchemathesisSandboxValidator:
 class OpenAPIValidationService:
     """Owns generated -> sandboxed -> validated promotion for OpenAPI connectors."""
 
-    def __init__(self, validator: SchemathesisSandboxValidator | None = None) -> None:
+    def __init__(
+        self,
+        validator: SchemathesisSandboxValidator | None = None,
+        *,
+        evidence_store: EvidenceStore | None = None,
+    ) -> None:
         self.validator = validator or SchemathesisSandboxValidator()
+        self.evidence_store = evidence_store
+
+    def _persist_evidence(
+        self,
+        registration: Registration,
+        report: OpenAPIValidationReport,
+        sandbox_url: str,
+    ) -> None:
+        if self.evidence_store is None:
+            return
+        parsed = urlsplit(sandbox_url)
+        self.evidence_store.append_evidence(
+            EvidenceRecord(
+                evidenceId=str(uuid4()),
+                organizationId=registration.organization_id,
+                kind="validation",
+                phase="validation",
+                connectorId=registration.manifest.connector_id,
+                payload={
+                    "engine": report.engine,
+                    "report": report.model_dump(by_alias=True, mode="json"),
+                    "sandboxHost": parsed.hostname,
+                    "sandboxScheme": parsed.scheme,
+                },
+            )
+        )
 
     def validate_registration(
         self,
@@ -179,8 +212,9 @@ class OpenAPIValidationService:
         if registration.status not in {"generated", "sandboxed"}:
             raise ValueError("Only generated or sandboxed connectors can enter OpenAPI validation")
 
-        registration.status = "sandboxed"
+        registration.set_status("sandboxed")
         report = self.validator.validate(schema, sandbox_url)
+        self._persist_evidence(registration, report, sandbox_url)
         if report.passed:
-            registration.status = "validated"
+            registration.set_status("validated")
         return report

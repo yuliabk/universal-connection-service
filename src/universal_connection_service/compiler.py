@@ -1,14 +1,21 @@
 from uuid import uuid4
 
 from .contracts import AuthRequirement, ConnectionPlan, ConnectionRequest
+from .persistence import EvidenceRecord, EvidenceStore
 from .policy import DefaultPolicyEngine, PolicyEngine, PolicyFacts
 from .registry import ConnectorRegistry
 
 
 class ConnectionCompiler:
-    def __init__(self, registry: ConnectorRegistry, policy_engine: PolicyEngine | None = None):
+    def __init__(
+        self,
+        registry: ConnectorRegistry,
+        policy_engine: PolicyEngine | None = None,
+        evidence_store: EvidenceStore | None = None,
+    ):
         self.registry = registry
         self.policy_engine = policy_engine or DefaultPolicyEngine()
+        self.evidence_store = evidence_store
 
     @staticmethod
     def service_id(req: ConnectionRequest) -> str:
@@ -31,11 +38,55 @@ class ConnectionCompiler:
             permissionIncrease=hints.permission_increase,
         )
 
-    def compile(self, req: ConnectionRequest) -> ConnectionPlan:
+    def _persist_policy_evidence(
+        self,
+        req: ConnectionRequest,
+        *,
+        phase: str,
+        connector_id: str | None,
+        trusted_connector: bool,
+        evaluation,
+    ) -> None:
+        if self.evidence_store is None:
+            return
+        self.evidence_store.append_evidence(
+            EvidenceRecord(
+                evidenceId=str(uuid4()),
+                organizationId=req.actor.organization_id,
+                kind="policy_decision",
+                phase=phase,
+                requestId=req.request_id,
+                connectorId=connector_id,
+                payload={
+                    "decision": evaluation.decision,
+                    "reasons": list(evaluation.reasons),
+                    "risk": evaluation.risk.model_dump(by_alias=True, mode="json"),
+                    "trustedConnector": trusted_connector,
+                    "serviceId": self.service_id(req),
+                    "capability": req.capability,
+                    "operation": req.operation,
+                },
+            )
+        )
+
+    def compile(self, req: ConnectionRequest, *, phase: str = "plan") -> ConnectionPlan:
+        if phase not in {"plan", "execution"}:
+            raise ValueError("policy evidence phase must be plan or execution")
         service_id = self.service_id(req)
-        found = self.registry.trusted(service_id, req.capability)
+        found = self.registry.trusted(
+            service_id,
+            req.capability,
+            req.actor.organization_id,
+        )
         evaluation = self.policy_engine.evaluate(
             self._policy_facts(req, trusted_connector=found is not None)
+        )
+        self._persist_policy_evidence(
+            req,
+            phase=phase,
+            connector_id=found.manifest.connector_id if found else None,
+            trusted_connector=found is not None,
+            evaluation=evaluation,
         )
 
         if found:
