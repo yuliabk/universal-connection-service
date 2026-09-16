@@ -253,19 +253,21 @@ class ConnectionService:
                 # Approvals authorize one execution attempt. Consume before the
                 # outbound call to prevent concurrent replay of a valid grant.
                 await self.approval_verifier.consume(ctx.approval_id)
-            except Exception:
+            except Exception as exc:
+                code = getattr(exc, "code", "APPROVAL_VERIFICATION_UNAVAILABLE")
+                message = getattr(exc, "safe_message", "Approval could not be consumed")
                 self._persist_approval_evidence(
                     req,
                     connector_id=plan.connector_id,
                     approval_id=ctx.approval_id,
                     valid=False,
-                    code="APPROVAL_VERIFICATION_UNAVAILABLE",
+                    code=code,
                 )
                 return self._failed(
                     req,
                     plan.service_id,
-                    "APPROVAL_VERIFICATION_UNAVAILABLE",
-                    "Approval could not be consumed",
+                    code,
+                    message,
                     user_action=True,
                     connector_id=plan.connector_id,
                     policy_decision=plan.policy_decision,
