@@ -130,7 +130,7 @@ class DurableExecutor:
         except ReceiptError as exc:
             return self._error(req, exc.code, receipt)
 
-    async def execute(self, req, ctx, registration):
+    async def execute(self, req, ctx, registration, *, allow_dispatch=True):
         receipt = None
         dispatched = False
         dispatch_started = False
@@ -156,6 +156,8 @@ class DurableExecutor:
                     raise ReceiptError("IDEMPOTENCY_CONFLICT")
                 if receipt.state != "prepared":
                     return self._cached(req, receipt)
+            if not allow_dispatch:
+                return self._error(req, "RECEIPT_NOT_DISPATCHED", receipt)
             if (registration.manifest.connector_id, registration.manifest.version) != (target.connector_id, target.connector_version):
                 raise ReceiptError("EXECUTION_CONNECTOR_MISMATCH")
             if not ctx.approval_id:

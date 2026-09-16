@@ -1,4 +1,5 @@
 import asyncio
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from mcp import Client
@@ -353,3 +354,53 @@ def test_workflow_lease_is_atomic_and_can_be_reclaimed_after_expiry():
     later = now + timedelta(seconds=11)
     assert store.claim_workflow("org-1", record.workflow_id, "lease-c", later + timedelta(seconds=10), later) is True
     store.close()
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_path, monkeypatch, uncertain):
+    class Connector(StubConnector):
+        async def execute(self, capability, input, ctx):
+            self.calls += 1
+            if uncertain:
+                raise TimeoutError("synthetic uncertain provider outcome")
+            return ConnectorResult(status="success", data={"ok": True})
+    connector = Connector(capabilities=("records.write",))
+    path = tmp_path / "resume.sqlite3"
+    store, _, service, _, orchestrator = stack(trusted=connector, path=path)
+    req = request(operation="update", capability="records.write")
+    req.operation_id = "resume-operation"
+    target = ExecutionTarget(organizationId="org-1", serviceId="records", capability="records.write",
+        providerAccountId="account-1", connectorId="trusted-records", connectorVersion="1.0.0",
+        operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
+        successIsFinal=True, resultRetentionSeconds=3600)
+    cipher = ResultCipher({"test": b"x" * 32}, "test")
+    service.durable_executor = DurableExecutor(store, cipher, (target,))
+    actor = principal("connectors:review", "approvals:issue")
+    started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
+    issued = orchestrator.issue_execution_approval(actor, started.workflow.workflow_id,
+        AutoConnectExecutionApprovalCommand(request=req, expiresInSeconds=300))
+    def fail_save(*args, **kwargs):
+        raise RuntimeError("synthetic workflow commit failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "_save", fail_save)
+        with pytest.raises(RuntimeError):
+            asyncio.run(orchestrator.advance(actor, started.workflow.workflow_id,
+                AutoConnectAdvanceCommand(request=req, executionApprovalId=issued.approval_id)))
+    assert connector.calls == 1
+    original = store.get_receipt("org-1", req.operation_id)
+    store.close()
+    reopened, _, service2, _, orchestrator2 = stack(trusted=connector, path=path)
+    service2.durable_executor = DurableExecutor(reopened, cipher, (target,))
+    resumed = asyncio.run(orchestrator2.advance(actor, started.workflow.workflow_id,
+        AutoConnectAdvanceCommand(request=req)))
+    assert resumed.workflow.stage == ("awaiting_reconciliation" if uncertain else "completed")
+    assert resumed.result.receipt_id == original.receipt_id
+    if uncertain:
+        assert resumed.result.error.code == "OUTCOME_UNKNOWN"
+        paused = asyncio.run(orchestrator2.advance(actor, started.workflow.workflow_id,
+            AutoConnectAdvanceCommand(request=req, executeWhenReady=False)))
+        assert paused.workflow.stage == "awaiting_reconciliation"
+    else:
+        assert resumed.result.status == "success"
+    assert connector.calls == 1
+    reopened.close()

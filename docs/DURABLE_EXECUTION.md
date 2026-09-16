@@ -96,3 +96,9 @@ Commit `e69d5db991681e49570151d068790bca053cef69` עבר [CI עם PostgreSQL 16 
 ה־audit הקיים מקבל את שדות הפעולה וה־approval hash בלבד; פרטי receipt, operationId, החלטת reconciliation וגרסת connector נשארים ב־outbox המקושר באותו auditId. הצלחת execution אינה ממתינה למסירה. כשל במסירה משאיר את ה־receipt הסופית ואת ה־outbox לשחזור ואינו קורא למחבר. זהו sink מקומי; מסירה למערכת audit חיצונית אינה ממומשת.
 
 בדיקות חדשות מכסות תחרות בין שני חיבורים, restart, הפרדת ארגונים, rollback בכשל ack, אובדן commit acknowledgement, התנגשות audit ID, cursor והתאוששות worker לאחר כשל discovery. מקומית: 6 עברו ו־5 בדיקות PostgreSQL דולגו; הרגרסיה לפני תוספת בדיקות cursor/worker: 148 עברו ו־46 דולגו. G3 נותר פתוח עד השלמת recovery, auto-connect, retention ו־restore.
+
+### G3 — חידוש workflow דרך receipt
+
+לפני בקשת אישור ביצוע, auto-connect בודק דרך ConnectionService אם יש תוצאת dispatch קודמת. הדגל הפנימי `allow_dispatch=False` מחייב בדיקות context, policy, tenant, actor וחשבון ספק רגילות; הוא אינו מכין receipt, צורך אישור או מפעיל connector. receipt חסרה או prepared מחזירה RECEIPT_NOT_DISPATCHED וממשיכה למסלול האישורים הרגיל. תוצאה סופית משחזרת completed, ותוצאה עמומה מחזירה awaiting_reconciliation. advance של workflow במצב זה יכול לרענן תוצאה שכבר נשמרה; הוא עדיין אינו מבצע בירור מול הספק.
+
+בדיקת fault injection נכשלת בשמירת workflow לאחר ביצוע ספק ושמירת receipt, פותחת מחדש את SQLite ומחדשת ללא approval ID. גם הצלחה וגם unknown נשמרות עם אותו receipt ומונה connector נשאר 1. בדיקת service נוספת מוכיחה שגם אישור תקף אינו מאפשר dispatch בנתיב status בלבד. מקומית: 33 בדיקות auto-connect/durable execution עברו ו־22 בדיקות PostgreSQL דולגו.

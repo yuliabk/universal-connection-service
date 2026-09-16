@@ -70,6 +70,21 @@ def execute(service, req, approval="synthetic-approval", **ctx_values):
         organizationId=req.actor.organization_id, userId=req.actor.user_id, approvalId=approval, **ctx_values)))
 
 
+def test_status_only_never_prepares_or_dispatches_even_with_valid_approval(stores):
+    store = stores()
+    req = request()
+    raw = approve(store, req)
+    svc, connector = build_service(store, req)
+    ctx = ExecutionContext(requestId=req.request_id, organizationId=req.actor.organization_id,
+        userId=req.actor.user_id, approvalId=raw)
+    result = asyncio.run(svc.execute(req, ctx, allow_dispatch=False))
+    assert result.error.code == "RECEIPT_NOT_DISPATCHED"
+    assert store.get_receipt(req.actor.organization_id, req.operation_id) is None
+    assert connector.calls == 0
+    assert execute(svc, req, raw).status == "success"
+    assert connector.calls == 1
+
+
 def test_restart_retry_returns_encrypted_result_without_consuming_again(stores):
     store = stores()
     req = request()

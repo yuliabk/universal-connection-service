@@ -270,7 +270,11 @@ class AutoConnectOrchestrator:
         if record is None:
             raise AutoConnectError("WORKFLOW_NOT_FOUND", "Connection workflow was not found", status_code=404)
         self._assert_request(record, request)
-        if record.stage in {"completed", "failed", "awaiting_reconciliation"}:
+        if record.stage in {"completed", "failed"}:
+            return AutoConnectResponse(workflow=self._view(record))
+        if record.stage == "awaiting_reconciliation" and (
+            not command.execute_when_ready or self.connection_service.durable_executor is None
+        ):
             return AutoConnectResponse(workflow=self._view(record))
 
         lease = self._claim(record)
@@ -306,6 +310,10 @@ class AutoConnectOrchestrator:
             record.connector_id = trusted.manifest.connector_id
             record.connector_version = trusted.manifest.version
             return await self._drive_execution(record, command, plan)
+
+        if record.stage == "awaiting_reconciliation":
+            record.last_code = "CONNECTION_UNAVAILABLE"
+            return AutoConnectResponse(workflow=self._view(record), plan=plan)
 
         candidate = self._select_candidate(record, command, plan)
         if candidate is None:
@@ -386,6 +394,19 @@ class AutoConnectOrchestrator:
             return AutoConnectResponse(workflow=self._view(record), plan=plan)
 
         approval = command.execution_approval_id.get_secret_value() if command.execution_approval_id else None
+        context = ExecutionContext(requestId=request.request_id, userId=request.actor.user_id,
+            organizationId=request.actor.organization_id, credentialHandle=command.credential_handle,
+            approvalId=approval, deadlineMs=command.deadline_ms)
+        if (command.execute_when_ready and request.operation_id
+            and self.connection_service.durable_executor is not None):
+            # A prior dispatch may have committed before the workflow save failed.
+            # This path cannot create/consume an approval or perform connector IO.
+            existing = await self.connection_service.execute(request, context, allow_dispatch=False)
+            if record.stage == "awaiting_reconciliation" and not existing.receipt_id:
+                record.last_code = existing.error.code if existing.error else "RECEIPT_NOT_FOUND"
+                return AutoConnectResponse(workflow=self._view(record), plan=plan, result=existing)
+            if existing.error is None or existing.error.code != "RECEIPT_NOT_DISPATCHED":
+                return self._execution_response(record, plan, existing)
         if plan.policy_decision == "REQUIRE_APPROVAL" and approval is None:
             record.stage = "awaiting_execution_approval"
             record.last_code = "EXECUTION_APPROVAL_REQUIRED"
@@ -398,15 +419,11 @@ class AutoConnectOrchestrator:
 
         result = await self.connection_service.execute(
             request,
-            ExecutionContext(
-                requestId=request.request_id,
-                userId=request.actor.user_id,
-                organizationId=request.actor.organization_id,
-                credentialHandle=command.credential_handle,
-                approvalId=approval,
-                deadlineMs=command.deadline_ms,
-            ),
+            context,
         )
+        return self._execution_response(record, plan, result)
+
+    def _execution_response(self, record, plan, result):
         record.result_audit_id = result.audit_id
         if result.status in {"success", "partial"}:
             record.stage = "completed"
