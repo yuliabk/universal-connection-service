@@ -209,7 +209,19 @@ class MCPConnectorAdapter:
                     retryable=True,
                 ),
             )
-        except Exception:
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            safe_message = getattr(exc, "safe_message", None)
+            if isinstance(code, str) and isinstance(safe_message, str):
+                return ConnectorResult(
+                    status="failed",
+                    error=ConnectionError(
+                        code=code,
+                        message=safe_message,
+                        retryable=bool(getattr(exc, "retryable", False)),
+                        userActionRequired=bool(getattr(exc, "user_action_required", False)),
+                    ),
+                )
             return ConnectorResult(
                 status="failed",
                 error=ConnectionError(
