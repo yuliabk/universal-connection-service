@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -20,6 +22,7 @@ from .registry import ConnectorRegistry
 
 
 _SANDBOX_POLICY_SERVICE = "ucs-sandbox-policy"
+_DNS_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 
 
 class SandboxMountGrant(Model):
@@ -37,8 +40,17 @@ class SandboxCapabilityProfile(Model):
     def normalize_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         normalized = tuple(sorted({host.strip().lower().rstrip(".") for host in value if host.strip()}))
         for host in normalized:
-            if "/" in host or ":" in host or " " in host or host in {"localhost", "127.0.0.1", "::1"}:
-                raise ValueError("sandbox egress hosts must be DNS hostnames")
+            if not host or len(host) > 253 or host == "localhost" or "*" in host:
+                raise ValueError("sandbox egress hosts must be concrete DNS hostnames")
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("sandbox egress hosts must not be IP addresses")
+            labels = host.split(".")
+            if any(not _DNS_LABEL.fullmatch(label) for label in labels):
+                raise ValueError("sandbox egress hosts must be concrete DNS hostnames")
         return normalized
 
     @model_validator(mode="after")
