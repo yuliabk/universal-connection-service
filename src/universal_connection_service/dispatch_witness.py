@@ -9,8 +9,11 @@ class DispatchWitness:
         if not store.receipts_durable or not witness_id:
             raise ValueError("a durable independently provisioned witness is required")
         self.store, self.witness_id = store, witness_id
-        with store._receipt_transaction() as conn:
+        with self._transaction() as conn:
             self._identity(conn)
+
+    def _transaction(self):
+        return self.store._receipt_transaction()
 
     @staticmethod
     def initialize(store, witness_id: str):
@@ -63,7 +66,7 @@ class DispatchWitness:
         return all(getattr(current, field) == getattr(previous, field) for field in fields)
 
     def check(self, organization_id, operation_id, receipt):
-        with self.store._receipt_transaction() as conn:
+        with self._transaction() as conn:
             self._identity(conn)
             previous = self._latest(conn, organization_id, operation_id)
             if previous is None:
@@ -76,7 +79,7 @@ class DispatchWitness:
                 raise ReceiptError("EXECUTION_RESTORE_QUARANTINED")
 
     def record_dispatch(self, receipt):
-        with self.store._receipt_transaction() as conn:
+        with self._transaction() as conn:
             self._identity(conn)
             previous = self._latest(conn, receipt.organization_id, receipt.operation_id)
             if (receipt.state != "dispatching" or not receipt.attempt_id or
@@ -84,12 +87,14 @@ class DispatchWitness:
                 (previous is not None and (not self._matches(receipt, previous) or
                     receipt.attempt_count != previous.attempt_count + 1))):
                 raise ReceiptError("EXECUTION_RESTORE_QUARANTINED")
-            inserted = self.store._receipt_query(conn, """INSERT INTO dispatch_witness_attempt
-                (organization_id, operation_id, attempt_count, receipt_json) VALUES (?, ?, ?, ?)
-                ON CONFLICT (organization_id, operation_id, attempt_count) DO NOTHING""",
-                (receipt.organization_id, receipt.operation_id, receipt.attempt_count, receipt.model_dump_json())).rowcount
-            if inserted != 1:
+            if not self._insert_attempt(conn, receipt):
                 raise ReceiptError("EXECUTION_RESTORE_QUARANTINED")
+
+    def _insert_attempt(self, conn, receipt):
+        return self.store._receipt_query(conn, """INSERT INTO dispatch_witness_attempt
+            (organization_id, operation_id, attempt_count, receipt_json) VALUES (?, ?, ?, ?)
+            ON CONFLICT (organization_id, operation_id, attempt_count) DO NOTHING""",
+            (receipt.organization_id, receipt.operation_id, receipt.attempt_count, receipt.model_dump_json())).rowcount == 1
 
     def close(self):
         self.store.close()

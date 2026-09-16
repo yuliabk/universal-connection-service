@@ -63,8 +63,11 @@ class SQLReceiptStore(ExecutionObservabilityStore):
     def _receipt_time(self, value):
         return value.isoformat()
 
+    def _approval_row(self, conn, ref_hash):
+        return self._receipt_query(conn, "SELECT * FROM approval_grant WHERE approval_ref_hash = ?", (ref_hash,)).fetchone()
+
     def _validate_execution_approval(self, conn, receipt, *, allow_consumed=False):
-        row = self._receipt_query(conn, "SELECT * FROM approval_grant WHERE approval_ref_hash = ?", (receipt.approval_ref_hash,)).fetchone()
+        row = self._approval_row(conn, receipt.approval_ref_hash)
         if not row:
             raise ReceiptError("APPROVAL_INVALID")
         if row["revoked_at"] is not None:
@@ -105,16 +108,37 @@ class SQLReceiptStore(ExecutionObservabilityStore):
             raise ReceiptError("RECEIPT_STORE_NOT_DURABLE")
         receipt = ExecutionReceipt(**intent.model_dump())
         with self._receipt_transaction() as conn:
-            self._receipt_query(conn, """
-                INSERT INTO execution_receipt (organization_id, operation_id, receipt_id, state, version, receipt_json)
-                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (organization_id, operation_id) DO NOTHING
-                """, (receipt.organization_id, receipt.operation_id, receipt.receipt_id, receipt.state, receipt.version, receipt.model_dump_json()))
+            self._insert_receipt(conn, receipt)
             existing = self._load_receipt(conn, intent.organization_id, intent.operation_id)
             # requestId is per attempt; connector upgrades cannot mint a new operation.
             fields = ("binding_digest", "user_id", "agent_id", "service_id", "provider_account_id", "capability", "operation")
             if existing is None or any(getattr(existing, key) != getattr(intent, key) for key in fields):
                 raise ReceiptError("IDEMPOTENCY_CONFLICT")
             return existing
+
+    def _insert_receipt(self, conn, receipt):
+        self._receipt_query(conn, """
+            INSERT INTO execution_receipt (organization_id, operation_id, receipt_id, state, version, receipt_json)
+            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (organization_id, operation_id) DO NOTHING
+            """, (receipt.organization_id, receipt.operation_id, receipt.receipt_id, receipt.state, receipt.version, receipt.model_dump_json()))
+
+    def _consume_execution_approval(self, conn, receipt, now):
+        timestamp = self._receipt_time(now)
+        return self._receipt_query(conn, """UPDATE approval_grant SET consumed_at = ?
+            WHERE approval_ref_hash = ? AND organization_id = ? AND consumed_at IS NULL
+            AND revoked_at IS NULL AND expires_at > ?""",
+            (timestamp, receipt.approval_ref_hash, receipt.organization_id, timestamp)).rowcount == 1
+
+    def _lock_execution_approval(self, conn, receipt):
+        return self._receipt_query(conn, """UPDATE approval_grant SET consumed_at = consumed_at
+            WHERE approval_ref_hash = ? AND organization_id = ? AND consumed_at IS NOT NULL
+            AND revoked_at IS NULL""", (receipt.approval_ref_hash, receipt.organization_id)).rowcount == 1
+
+    def _append_execution_attempt(self, conn, receipt, request_id):
+        self._receipt_query(conn, """INSERT INTO execution_attempt
+            (organization_id, operation_id, attempt_id, request_id, receipt_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""", (receipt.organization_id, receipt.operation_id, receipt.attempt_id,
+                request_id, receipt.version, receipt.updated_at.isoformat()))
 
     def _expected(self, conn, organization_id, operation_id, expected_version, allowed_states):
         receipt = self._load_receipt(conn, organization_id, operation_id)
@@ -144,12 +168,7 @@ class SQLReceiptStore(ExecutionObservabilityStore):
                 if approval_ref_hash is not None:
                     receipt.approval_ref_hash = approval_ref_hash
                 self._validate_execution_approval(conn, receipt)
-                timestamp = self._receipt_time(utc_now())
-                consumed = self._receipt_query(conn, """UPDATE approval_grant SET consumed_at = ?
-                    WHERE approval_ref_hash = ? AND organization_id = ? AND consumed_at IS NULL
-                    AND revoked_at IS NULL AND expires_at > ?""",
-                    (timestamp, receipt.approval_ref_hash, organization_id, timestamp))
-                if consumed.rowcount != 1:
+                if not self._consume_execution_approval(conn, receipt, utc_now()):
                     raise ReceiptError("APPROVAL_UNAVAILABLE")
                 approval_expires = self._validate_execution_approval(conn, receipt, allow_consumed=True)
             receipt.state = "dispatching"
@@ -162,10 +181,7 @@ class SQLReceiptStore(ExecutionObservabilityStore):
             receipt.attempt_id = str(uuid4())
             receipt.attempt_count += 1
             self._save(conn, receipt, expected_version)
-            self._receipt_query(conn, """
-                INSERT INTO execution_attempt (organization_id, operation_id, attempt_id, request_id, receipt_version, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """, (organization_id, operation_id, receipt.attempt_id, request_id, receipt.version, receipt.updated_at.isoformat()))
+            self._append_execution_attempt(conn, receipt, request_id)
             return receipt
 
     def begin_receipt_replay(self, organization_id: str, operation_id: str, expected_version: int,
@@ -182,10 +198,7 @@ class SQLReceiptStore(ExecutionObservabilityStore):
             self._validate_execution_approval(conn, receipt, allow_consumed=True)
             # Serialize authorization with concurrent revocation, without minting
             # a second grant or altering its original consumption timestamp.
-            locked = self._receipt_query(conn, """UPDATE approval_grant SET consumed_at = consumed_at
-                WHERE approval_ref_hash = ? AND organization_id = ? AND consumed_at IS NOT NULL
-                AND revoked_at IS NULL""", (approval_ref_hash, organization_id)).rowcount
-            if locked != 1:
+            if not self._lock_execution_approval(conn, receipt):
                 raise ReceiptError("APPROVAL_UNAVAILABLE")
             self._validate_execution_approval(conn, receipt, allow_consumed=True)
             now = utc_now()
@@ -199,10 +212,7 @@ class SQLReceiptStore(ExecutionObservabilityStore):
             receipt.attempt_count += 1
             receipt.attempt_id = str(uuid4())
             self._save(conn, receipt, expected_version)
-            self._receipt_query(conn, """INSERT INTO execution_attempt
-                (organization_id, operation_id, attempt_id, request_id, receipt_version, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)""", (organization_id, operation_id, receipt.attempt_id,
-                    request_id, receipt.version, receipt.updated_at.isoformat()))
+            self._append_execution_attempt(conn, receipt, request_id)
             return receipt
 
     def mark_unresolved(self, organization_id: str, operation_id: str, expected_version: int, state: Literal["unknown", "pending"]) -> ExecutionReceipt:
@@ -260,24 +270,28 @@ class SQLReceiptStore(ExecutionObservabilityStore):
             )
             receipt.audit_id = event.event_id
             self._save(conn, receipt, expected_version)
-            if result_ciphertext is not None:
-                if len(result_ciphertext) > 2_000_000:
-                    raise ReceiptError("RESULT_TOO_LARGE")
-                self._receipt_query(conn, """INSERT INTO execution_result (organization_id, operation_id, ciphertext)
-                    VALUES (?, ?, ?)""", (organization_id, operation_id, result_ciphertext))
-            self._receipt_query(conn, """
-                INSERT INTO execution_outbox (organization_id, event_id, operation_id, event_json)
-                VALUES (?, ?, ?, ?)
-                """, (organization_id, event.event_id, operation_id, event.model_dump_json()))
+            if result_ciphertext is not None and len(result_ciphertext) > 2_000_000:
+                raise ReceiptError("RESULT_TOO_LARGE")
+            self._write_completion(conn, receipt, event, result_ciphertext)
             return receipt
+
+    def _write_completion(self, conn, receipt, event, result_ciphertext):
+        if result_ciphertext is not None:
+            self._receipt_query(conn, """INSERT INTO execution_result (organization_id, operation_id, ciphertext)
+                VALUES (?, ?, ?)""", (receipt.organization_id, receipt.operation_id, result_ciphertext))
+        self._receipt_query(conn, """INSERT INTO execution_outbox (organization_id, event_id, operation_id, event_json)
+            VALUES (?, ?, ?, ?)""", (receipt.organization_id, event.event_id, receipt.operation_id, event.model_dump_json()))
+
+    def _lock_receipt_row(self, conn, organization_id, operation_id):
+        self._receipt_query(conn, """UPDATE execution_receipt SET version = version
+            WHERE organization_id = ? AND operation_id = ?""", (organization_id, operation_id))
 
     def quarantine_conflicting_outcome(self, organization_id, operation_id, observed_state):
         if observed_state not in {"succeeded", "failed_no_effect"}:
             raise ValueError("only authoritative final outcomes can conflict")
         with self._receipt_transaction() as conn:
             # Serialize against completion and other conflict reports in PostgreSQL.
-            self._receipt_query(conn, """UPDATE execution_receipt SET version = version
-                WHERE organization_id = ? AND operation_id = ?""", (organization_id, operation_id))
+            self._lock_receipt_row(conn, organization_id, operation_id)
             receipt = self._load_receipt(conn, organization_id, operation_id)
             if receipt is None or receipt.state not in {"succeeded", "failed_no_effect"}:
                 raise ReceiptError("RECEIPT_STATE_CONFLICT")

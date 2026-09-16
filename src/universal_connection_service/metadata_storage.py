@@ -163,6 +163,14 @@ class MetadataRepository:
             (domain, self._tenant_index(organization_id), after, limit)).fetchall()
         return [self._open_document(domain, organization_id, row) for row in rows]
 
+    def delete(self, conn, domain: str, organization_id: str, identity: tuple[str, ...], expected_revision: int) -> bool:
+        """CAS deletion for payloads/indexes; domain code must retain identities."""
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("nonnegative revision required")
+        return self.store._receipt_query(conn, """DELETE FROM metadata_document
+            WHERE domain = ? AND tenant_index = ? AND record_index = ? AND revision = ?""",
+            (domain, self._tenant_index(organization_id), self._record_index(domain, organization_id, identity), expected_revision)).rowcount == 1
+
     def tenant_page(self, conn, *, after: str = "", limit: int = 100) -> list[tuple[str, str]]:
         """Host maintenance only; not an API for tenants to enumerate each other."""
         if type(limit) is not int or not 1 <= limit <= 100:

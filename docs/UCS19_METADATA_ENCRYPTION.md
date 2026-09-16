@@ -1,6 +1,6 @@
 # UCS-19 — השלמת הצפנת metadata
 
-מצב: תשתית הצפנה ואחסון טרנזקציוני מומשה; שילוב בממשקי StateStore וב־runtime טרם הושלם. אין לטעון שהפעלת UCS הקיימת מצפינה metadata רק משום שמיגרציה 7 הותקנה.
+מצב: תשתית ההצפנה חוברה לממשקי StateStore. גם ה־witness חובר לאחסון מוצפן עצמאי. חיבור runtime ומעבר נתונים קיימים טרם הושלמו. אין לטעון שהפעלת UCS הקיימת מצפינה metadata רק משום שמיגרציה 7 הותקנה.
 
 ## החלטת עבודה
 
@@ -18,8 +18,8 @@
 
 ## שילוב שנותר לביצוע
 
-1. לחבר את כל ports של StateStore למאגר המסמכים המוצפן, תוך שימור גבול טרנזקציה יחיד לצריכת approval ול־dispatch, ול־result/outbox. אין לפרש SQL באופן גנרי כדי לנחש אילו ערכים להצפין.
-2. לחבר witness נפרד לאותו פורמט בלי לשנות receiptId, providerKey, attemptCount או binding. profile ומפתחות של primary ושל witness חייבים להיבדק לפני IO.
+1. ממשקי StateStore חוברו למאגר המסמכים המוצפן תוך שימור טרנזקציה יחידה לצריכת approval ו־dispatch ול־result/outbox; נותר להפעילם דרך תצורת runtime מאומתת. אין לפרש SQL באופן גנרי כדי לנחש אילו ערכים להצפין.
+2. witness נפרד חובר לפורמט המוצפן בלי לשנות receiptId, providerKey, attemptCount או binding; נותר לחבר provisioning וטעינה ב־runtime. profile ומפתחות של primary ושל witness חייבים להיבדק לפני IO.
 3. להוסיף runtime configuration מפורש עם secrets ממנגנון המארח. תצורה חלקית, מפתח חסר או ניסיון לפתוח store מוצפן במצב רגיל חייבים להיכשל לפני dispatch; אין fallback שקט למסד חדש או לאחסון לא מוצפן.
 4. להוסיף מעבר offline לנתונים קיימים: לעצור writers, להעתיק ליעד מוצפן חדש, לאמת ספירות וזהויות והיכולת לפענח את כל סוגי הרשומות, ולהפעיל רק כאשר primary ו־witness תואמים. אין לייצר מזהים חדשים או לבצע פעולות ספק בעת ההעברה. המסד הישן, WAL וגיבויים נותרים עותקים רגישים עד טיפול נפרד בפריסה.
 5. להוסיף re-encryption מוגבל באצוות עם CAS ומעקב אחר key IDs, בלי מחיקת tombstones ובלי הרחבת חלון replay.
@@ -40,3 +40,21 @@
 צריכת אישור, revocation, claim ועדכון workflow קוראים ונועלים את המסמך בתוך טרנזקציה ומעדכנים ב־CAS. lease נשמר בתוך ciphertext גם כשהוא מוחרג מסריאליזציית ה־API. revision של המסמך הוא מנגנון אחסון נפרד מ־revision העסקי של workflow; claim/release אינם משנים את האחרון. עדכון workflow רשאי לשנות רק את השדות שהמימוש הקודם עדכן ואינו משנה request identity או fingerprint.
 
 רשימות לפי request/kind מסננות לאחר פענוח באצוות בתוך tenant. הדבר משמר את החוזה הקיים אך מגדיל את עלות הקריאה לעומת אינדקס SQL ייעודי; אין טענת שיפור ביצועים. ה־ports הקיימים מחזירים list ולכן התוצאה עצמה עדיין יכולה להיות גדולה. לפני הרחבת שימוש production נדרשת מדידת עומס ותקצוב מתאים.
+
+## חיבור ReceiptStore ומעברי הביצוע
+
+`EncryptedStateStore` מחבר את יתר ממשקי StateStore למאגר המוצפן ומשתמש מחדש במעברי המצב הקיימים של SQLReceiptStore. פעולות האחסון הופרדו ל־hooks מפורשים: טעינת אישור, צריכה ונעילה, שמירת receipt וניסיון ביצוע, וסיום עם תוצאה ו־outbox. אין תרגום SQL גנרי ואין forwarding לטבלאות ה־metadata הגלויות; מסלול SQL שלא הוחלף נכשל במפורש.
+
+צריכת האישור ושמירת dispatch/attempt מתבצעות בטרנזקציה מוצפנת אחת. completion שומר receipt, payload ואירוע outbox יחד. אינדקס pending מוצפן מאפשר acknowledgement בלי מחיקת אירוע הביקורת; יצירת audit והסרת pending אטומיות, וה־eventId המקורי נשמר. retention מוחק רק payload והפניית הסריקה שלו, ומעדכן resultPurgedAt בלי להסיר receipt או מפתח ספק.
+
+גם notices, תקציבי recovery, backoff, quarantine ותצפית תפעולית משתמשים במסמכים מוצפנים. רשימות שומרות על סדר המזהים וה־cursor של הממשק הישן באמצעות פענוח באצוות ובחירת התוצאות המוגבלות בזיכרון; זמן הסריקה אינו מוגבל לגודל הדף המוחזר. כך נשמרת התאימות בלי לחשוף timestamps או מזהים באינדקסים גלויים, במחיר קריאות ופענוחים נוספים.
+
+הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; חיבור runtime, migration וכל מטריצת הקריסה בתהליכים נפרדים על שני האחסונים המוצפנים עדיין נדרשים.
+
+## witness מוצפן ועצמאי
+
+`EncryptedDispatchWitness` שומר זהות ועדויות dispatch במאגר מוצפן נפרד ומשתמש באותם כללי התאמה ו־quarantine של DispatchWitness. המפתח לאינדקס קבוצת הניסיונות הוא HMAC של tenant/operation/profile; רשומות הניסיונות עצמן append-only ומוצפנות. latest מחושב מתוך הרשומות של אותה פעולה, בלי מצביע mutable שהיעלמותו עלולה להסתיר ניסיון שכבר נשלח.
+
+provisioning מתאפשר רק באזור מוצפן ריק, ללא נתוני primary קיימים או טבלאות witness ישנות. הוא אינו כלי migration או איפוס. identity נבדקת בכל טרנזקציה, ואיסור שיתוף מסד עם primary נשמר גם כשה־primary הוא EncryptedStateStore.
+
+בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. חיבור runtime, מעבר offline וראיות קריסה בתהליכים נפרדים כשההצפנה פעילה עדיין נדרשים.
