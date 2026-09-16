@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .approvals import ApprovalStore, PersistentApprovalVerifier
+from .auto_connect import AutoConnectOrchestrator, build_auto_connect_router
 from .contracts import ConnectionPlan, ConnectionRequest, ConnectionResult, ExecutionContext
 from .control_plane import ControlPlaneService, StaticBearerAuthenticator, build_control_plane_router
 from .credentials import AgentVaultCredentialResolver, AgentVaultCredentialResolverConfig
@@ -16,7 +17,7 @@ from .packages import (
     Ed25519PackageVerifier,
     FilesystemPackageSource,
 )
-from .persistence import SQLiteStateStore
+from .persistence import SQLiteStateStore, WorkflowStore
 from .postgres_store import PostgresStateStore, config_from_env
 from .registry import ConnectorRegistry
 from .rehydration import ConnectorRuntimeRehydrator, RehydrationReport
@@ -111,6 +112,7 @@ control_plane_authenticator, control_plane_kind = _build_control_plane_authentic
 credential_resolver, credential_broker_kind = _build_credential_resolver()
 registry = ConnectorRegistry(state_store=state_store)
 approval_store = state_store if isinstance(state_store, ApprovalStore) else None
+workflow_store = state_store if isinstance(state_store, WorkflowStore) else None
 approval_verifier = PersistentApprovalVerifier(approval_store) if approval_store is not None else None
 service = ConnectionService(
     registry,
@@ -133,6 +135,19 @@ control_plane_service = ControlPlaneService(
     mcp_validation_service=mcp_validation_service,
     require_distinct_approver=_env_bool("UCS_CONTROL_PLANE_REQUIRE_DISTINCT_APPROVER"),
 )
+auto_connect_orchestrator = (
+    AutoConnectOrchestrator(
+        workflow_store=workflow_store,
+        connection_service=service,
+        control_plane_service=control_plane_service,
+        registry=registry,
+        approval_store=approval_store,
+        evidence_store=state_store,
+    )
+    if workflow_store is not None
+    else None
+)
+auto_connect_kind = "persistent" if auto_connect_orchestrator is not None else "disabled"
 package_rehydration = RehydrationReport()
 
 
@@ -164,6 +179,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
+app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
 
 
 @app.get("/health")
@@ -175,6 +191,7 @@ def health():
         "discovery": discovery_kind,
         "controlPlane": control_plane_kind,
         "credentialBroker": credential_broker_kind,
+        "autoConnect": auto_connect_kind,
         "packages": {
             "loaded": package_rehydration.loaded,
             "skipped": package_rehydration.skipped,
