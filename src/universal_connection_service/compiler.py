@@ -24,6 +24,13 @@ class ConnectionCompiler:
     def service_id(req: ConnectionRequest) -> str:
         return req.service.id or req.service.name.lower().replace(" ", "-")
 
+    @staticmethod
+    def _plan_strategy(candidate) -> str:
+        # Discovery uses protocol-oriented strategy names (mcp/api), while the
+        # public ConnectionPlan distinguishes an API that is already official
+        # from an adapter that still has to be generated and validated.
+        return "mcp" if candidate.strategy == "mcp" else "generated_api_adapter"
+
     def _policy_facts(self, req: ConnectionRequest, *, trusted_connector: bool) -> PolicyFacts:
         hints = req.risk_hints
         return PolicyFacts(
@@ -73,8 +80,6 @@ class ConnectionCompiler:
         )
 
     def _discover(self, req: ConnectionRequest, *, phase: str):
-        # Discovery is a planning concern only. Execution must never consult an
-        # external registry to decide what implementation should run.
         if phase != "plan" or self.discovery_engine is None:
             return (), None, False
         candidates = self.discovery_engine.discover(
@@ -108,14 +113,8 @@ class ConnectionCompiler:
         if phase not in {"plan", "execution"}:
             raise ValueError("policy evidence phase must be plan or execution")
         service_id = self.service_id(req)
-        found = self.registry.trusted(
-            service_id,
-            req.capability,
-            req.actor.organization_id,
-        )
-        evaluation = self.policy_engine.evaluate(
-            self._policy_facts(req, trusted_connector=found is not None)
-        )
+        found = self.registry.trusted(service_id, req.capability, req.actor.organization_id)
+        evaluation = self.policy_engine.evaluate(self._policy_facts(req, trusted_connector=found is not None))
         self._persist_policy_evidence(
             req,
             phase=phase,
@@ -126,72 +125,39 @@ class ConnectionCompiler:
 
         if found:
             return ConnectionPlan(
-                planId=str(uuid4()),
-                requestId=req.request_id,
-                serviceId=service_id,
-                capability=req.capability,
-                connectorId=found.manifest.connector_id,
-                strategy="trusted_connector",
-                authRequirement=found.manifest.auth,
-                risk=evaluation.risk,
-                requiresBuild=False,
-                requiresValidation=False,
+                planId=str(uuid4()), requestId=req.request_id, serviceId=service_id, capability=req.capability,
+                connectorId=found.manifest.connector_id, strategy="trusted_connector", authRequirement=found.manifest.auth,
+                risk=evaluation.risk, requiresBuild=False, requiresValidation=False,
                 requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
-                policyDecision=evaluation.decision,
-                policyReasons=evaluation.reasons,
+                policyDecision=evaluation.decision, policyReasons=evaluation.reasons,
             )
 
         candidates, selected, requires_selection = self._discover(req, phase=phase)
         if selected is not None:
             return ConnectionPlan(
-                planId=str(uuid4()),
-                requestId=req.request_id,
-                serviceId=service_id,
-                capability=req.capability,
-                strategy=selected.strategy,
-                authRequirement=selected.auth_requirement,
-                risk=evaluation.risk,
-                requiresBuild=selected.requires_build,
-                requiresValidation=True,
+                planId=str(uuid4()), requestId=req.request_id, serviceId=service_id, capability=req.capability,
+                strategy=self._plan_strategy(selected), authRequirement=selected.auth_requirement,
+                risk=evaluation.risk, requiresBuild=selected.requires_build, requiresValidation=True,
                 requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
-                policyDecision=evaluation.decision,
-                policyReasons=evaluation.reasons,
-                discoveryCandidates=candidates,
-                selectedDiscoveryCandidateId=selected.candidate_id,
-                requiresSelection=False,
+                policyDecision=evaluation.decision, policyReasons=evaluation.reasons,
+                discoveryCandidates=candidates, selectedDiscoveryCandidateId=selected.candidate_id, requiresSelection=False,
             )
 
         if candidates and requires_selection:
             return ConnectionPlan(
-                planId=str(uuid4()),
-                requestId=req.request_id,
-                serviceId=service_id,
-                capability=req.capability,
-                strategy=candidates[0].strategy,
-                authRequirement=AuthRequirement(type="other"),
-                risk=evaluation.risk,
-                requiresBuild=all(candidate.requires_build for candidate in candidates),
-                requiresValidation=True,
-                requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
-                policyDecision=evaluation.decision,
-                policyReasons=evaluation.reasons,
-                discoveryCandidates=candidates,
-                requiresSelection=True,
+                planId=str(uuid4()), requestId=req.request_id, serviceId=service_id, capability=req.capability,
+                strategy=self._plan_strategy(candidates[0]), authRequirement=AuthRequirement(type="other"),
+                risk=evaluation.risk, requiresBuild=all(candidate.requires_build for candidate in candidates),
+                requiresValidation=True, requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
+                policyDecision=evaluation.decision, policyReasons=evaluation.reasons,
+                discoveryCandidates=candidates, requiresSelection=True,
             )
 
         strategy = "official_api" if req.service.base_url else "generated_api_adapter"
         return ConnectionPlan(
-            planId=str(uuid4()),
-            requestId=req.request_id,
-            serviceId=service_id,
-            capability=req.capability,
-            strategy=strategy,
-            authRequirement=AuthRequirement(type="other"),
-            risk=evaluation.risk,
-            requiresBuild=True,
-            requiresValidation=True,
+            planId=str(uuid4()), requestId=req.request_id, serviceId=service_id, capability=req.capability,
+            strategy=strategy, authRequirement=AuthRequirement(type="other"), risk=evaluation.risk,
+            requiresBuild=True, requiresValidation=True,
             requiresHumanApproval=evaluation.decision == "REQUIRE_APPROVAL",
-            policyDecision=evaluation.decision,
-            policyReasons=evaluation.reasons,
-            discoveryCandidates=candidates,
+            policyDecision=evaluation.decision, policyReasons=evaluation.reasons, discoveryCandidates=candidates,
         )
