@@ -194,7 +194,8 @@ class DurableExecutor:
         self.witness.record_dispatch(receipt)
         timeout = ctx.deadline_ms / 1000
         if receipt.provider_not_after is not None:
-            timeout = min(timeout, (receipt.provider_not_after - utc_now()).total_seconds())
+            margin = contract.clock_margin_ms / 1000 if contract else 0
+            timeout = min(timeout, (receipt.provider_not_after - utc_now()).total_seconds() - margin)
         if timeout <= 0:
             raise ReceiptError("REPLAY_BUDGET_EXHAUSTED")
         def call():
@@ -225,8 +226,9 @@ class DurableExecutor:
             raise ReceiptError("APPROVAL_REQUIRED")
         try:
             receipt = self.store.begin_receipt_replay(receipt.organization_id, receipt.operation_id,
-                receipt.version, req.request_id, contract.digest(), contract.replay.max_attempts,
-                approval_ref_hash(ctx.approval_id))
+                  receipt.version, req.request_id, contract.digest(), contract.replay.max_attempts,
+                  approval_ref_hash(ctx.approval_id), backoff_ms=contract.recovery_backoff_ms,
+                  clock_margin_ms=contract.clock_margin_ms)
         except ReceiptError:
             raise
         except Exception:
@@ -249,7 +251,8 @@ class DurableExecutor:
             raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
         deadline = receipt.created_at + timedelta(seconds=contract.lookup_window_seconds)
         receipt = self.store.begin_receipt_lookup(receipt.organization_id, receipt.operation_id,
-            receipt.version, contract.digest(), contract.max_lookups, deadline)
+            receipt.version, contract.digest(), contract.max_lookups, deadline,
+            backoff_ms=contract.recovery_backoff_ms)
         key = self._provider_key(receipt)
         try:
             timeout = min(ctx.deadline_ms, contract.lookup_timeout_ms) / 1000

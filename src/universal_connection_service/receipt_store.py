@@ -168,7 +168,10 @@ class SQLReceiptStore:
             return receipt
 
     def begin_receipt_replay(self, organization_id: str, operation_id: str, expected_version: int,
-                            request_id: str, contract_digest: str, max_attempts: int, approval_ref_hash: str) -> ExecutionReceipt:
+                            request_id: str, contract_digest: str, max_attempts: int, approval_ref_hash: str,
+                            *, backoff_ms: int = 1000, clock_margin_ms: int = 1000) -> ExecutionReceipt:
+        if backoff_ms <= 0 or clock_margin_ms <= 0:
+            raise ValueError("recovery timing must be positive")
         with self._receipt_transaction() as conn:
             receipt = self._expected(conn, organization_id, operation_id, expected_version, {"dispatching", "unknown", "pending"})
             if not contract_digest or receipt.recovery_contract_digest != contract_digest:
@@ -184,9 +187,13 @@ class SQLReceiptStore:
             if locked != 1:
                 raise ReceiptError("APPROVAL_UNAVAILABLE")
             self._validate_execution_approval(conn, receipt, allow_consumed=True)
-            if (receipt.provider_not_after is None or utc_now() >= receipt.provider_not_after
+            now = utc_now()
+            if (receipt.provider_not_after is None or now + timedelta(milliseconds=clock_margin_ms) >= receipt.provider_not_after
                 or receipt.attempt_count >= max_attempts):
                 raise ReceiptError("REPLAY_BUDGET_EXHAUSTED")
+            if receipt.recovery_not_before is not None and now < receipt.recovery_not_before:
+                raise ReceiptError("RECOVERY_BACKOFF_REQUIRED")
+            receipt.recovery_not_before = now + timedelta(milliseconds=backoff_ms)
             receipt.state = "dispatching"
             receipt.attempt_count += 1
             receipt.attempt_id = str(uuid4())
@@ -207,13 +214,20 @@ class SQLReceiptStore:
             return receipt
 
     def begin_receipt_lookup(self, organization_id: str, operation_id: str, expected_version: int,
-                             contract_digest: str, max_lookups: int, deadline: datetime) -> ExecutionReceipt:
+                             contract_digest: str, max_lookups: int, deadline: datetime,
+                             *, backoff_ms: int = 1000) -> ExecutionReceipt:
+        if backoff_ms <= 0:
+            raise ValueError("recovery timing must be positive")
         with self._receipt_transaction() as conn:
             receipt = self._expected(conn, organization_id, operation_id, expected_version, {"dispatching", "unknown", "pending"})
             if not contract_digest or receipt.recovery_contract_digest != contract_digest:
                 raise ReceiptError("RECOVERY_CONTRACT_MISMATCH")
             if utc_now() >= deadline or receipt.lookup_count >= max_lookups:
                 raise ReceiptError("RECOVERY_BUDGET_EXHAUSTED")
+            now = utc_now()
+            if receipt.recovery_not_before is not None and now < receipt.recovery_not_before:
+                raise ReceiptError("RECOVERY_BACKOFF_REQUIRED")
+            receipt.recovery_not_before = now + timedelta(milliseconds=backoff_ms)
             receipt.lookup_count += 1
             # Fence a late execution response; lookup completion uses this version.
             if receipt.state == "dispatching":

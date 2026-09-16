@@ -78,6 +78,8 @@ def setup(store, path, max_attempts=3):
 
 
 def replay(svc, req, raw):
+    import time
+    time.sleep(0.002)  # Explicit synthetic 1ms recovery interval.
     return asyncio.run(svc.execute(req, ExecutionContext(requestId=req.request_id,
         userId=req.actor.user_id, organizationId=req.actor.organization_id, approvalId=raw), replay=True))
 
@@ -164,8 +166,9 @@ def test_replay_policy_requires_provider_expiry_and_concurrency_guarantees():
     with pytest.raises(ValidationError):
         ReplayPolicy(deduplicationWindowSeconds=300, maxAttempts=2,
             providerEnforcesNotAfter=False, concurrentDeduplication=True)
-    old = contract().model_dump(mode="json", by_alias=True, exclude={"replay", "dispatch_outcomes"})
-    assert contract().digest() == hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    historical = contract().model_copy(update={"recovery_backoff_ms": 1000, "clock_margin_ms": 1000})
+    old = historical.model_dump(mode="json", by_alias=True, exclude={"replay", "dispatch_outcomes", "recovery_backoff_ms", "clock_margin_ms"})
+    assert historical.digest() == hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def test_provider_deadline_cannot_outlive_original_approval(stores, tmp_path):

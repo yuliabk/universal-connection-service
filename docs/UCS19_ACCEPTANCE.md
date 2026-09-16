@@ -13,7 +13,7 @@
 | 003: הצלחת ספק ואז crash | test_process_crash_after_provider_commit_then_keyed_lookup_recovers | מכוסה בתהליך ילד עם exit(42), מונה ספק עצמאי ופתיחה מחדש בשני backends; CI 2923b21 |
 | 003: accepted אסינכרוני | חוזה dispatchOutcomes מקובע, ProviderOutcome עם בדיקת key/account/binding/contract; test_dispatch_outcomes.py | מומש pending מ־dispatch, ללא replay בזמן pending; בדיקת exit אחרי pending commit וחידוש ב־lookup בשני backends נוספה ומחייבת CI עדכני |
 | 004: replay מוגן | RecoveryContract, ReplayPolicy, begin_receipt_replay; test_execution_replay.py | מכוסה בספק סינתטי בעל dedup אטומי ואכיפת notAfter; אין ספק Production מאושר |
-| 004: חלון שפג / lookup לא החלטי / none | test_unresolved_lookup_never_reexecutes_and_budget_survives_restart, test_expired_dispatch_is_rejected_locally_and_by_provider_after_cache_eviction | מכוסה; backoff ומרווח שעון מפורשים עדיין חסרים לעומת design |
+| 004: חלון שפג / lookup לא החלטי / none | test_unresolved_lookup_never_reexecutes_and_budget_survives_restart, test_expired_dispatch_is_rejected_locally_and_by_provider_after_cache_eviction | מכוסה; נוספו backoff משותף עמיד ומרווח שעון מפורשים ב־test_recovery_timing.py; מחייב CI עדכני |
 | 005: אישור בוטל אחרי כשל | begin_receipt_replay מאמת את האישור המקורי תחת transaction; test_replay_requires_original_still_valid_approval | מכוסה revoked/expired/replacement/missing בשני backends |
 | 005: tenant ו־actor | execution_api, executionActors, target account/credential binding; test_execution_auth.py, test_result_access_rechecks_policy_and_actor_before_decryption | מכוסה בגבולות HTTP ו־auto-connect; SDK מניח מארח מאמת |
 | 005: עובד ישן חוזר | test_stale_execution_process.py מחזיק ילד חי לפני/אחרי אפקט הספק, מבצע replay בהורה ואז משחרר אותו | נוספה הוכחה ל־receipt סופית שאינה נדרסת, השפעה יחידה ואירוע outbox יחיד; PostgreSQL דורש CI לגרסה זו |
@@ -24,9 +24,9 @@
 
 ## סעיפים נוספים מה־design ומ־tasks שאינם סגורים
 
-1. להגדיר ולממש backoff עמיד וחיובי, ומרווח שעון בחלון replay. אין להסתפק במגבלת מספר קריאות כתחליף לקצב ניסיונות.
+1. מומשו recoveryBackoffMs, recoveryNotBefore עמיד ומשותף ל־lookup/replay ו־clockMarginMs. בדיקות פתיחה מחדש, אובדן commit acknowledgement ופקיעה משתמשות בשעון מוזרק; נדרשת ראיית CI עדכנית לשני backends.
 2. להוסיף התראות/מדדים ממוזערים עבור unknown, conflicts, blocked replay, outbox backlog וגיל receipt, בלי מזהי לקוחות בתוויות משותפות. התראה על מיצוי תקציב צריכה להיות ניתנת לצפייה למורשה אחרי restart.
-3. accepted/pending מתשובת dispatch מאומתת מומש בחוזה dispatchOutcomes ובבדיקת crash/resume. אין הסקת success מ־HTTP accepted; סגירת הסעיף מחייבת תוצאת CI של השינוי בשני backends.
+3. accepted/pending מתשובת dispatch מאומתת מומש בחוזה dispatchOutcomes ובבדיקת crash/resume. אין הסקת success מ־HTTP accepted; הסעיף אומת ב־CI של a8d4630: 322 בדיקות עברו ללא דילוגים, כולל שני backends (run 35132662022).
 4. ה־design דורש quarantine לראיה סופית סותרת. כיום תוצאה מאוחרת אינה דורסת terminal receipt; זה אינו בפני עצמו מנגנון תיעוד/בירור של סתירה סמכותית.
 5. להשלים fault injection בתהליכים נפרדים לפני/אחרי intent, אחרי dispatch commit ולפני IO, ואחרי result commit לפני תגובת הלקוח/ack של audit. בדיקות transaction וחריגות באותו תהליך הן ראיות משלימות בלבד.
 6. לבדוק מעבר גרסאות binding: כיום canonical hash כולל version=1; יש לקבע במפורש כיצד receipt היסטורית מזוהה כאשר גרסת הנרמול משתנה.

@@ -23,7 +23,7 @@ from universal_connection_service.receipts import utc_now
 def contract(**updates):
     return RecoveryContract(contractId="synthetic-ledger", revision="1", evidenceSha256="a" * 64,
         approvalReference="synthetic-contract-review", lookupWindowSeconds=3600,
-        maxLookups=updates.get("max_lookups", 3), lookupTimeoutMs=500)
+        maxLookups=updates.get("max_lookups", 3), lookupTimeoutMs=500, recoveryBackoffMs=1, clockMarginMs=1)
 
 
 class Provider(WriteConnector):
@@ -66,6 +66,8 @@ def setup(store, recovery=None):
 
 
 def reconcile(svc, req):
+    import time
+    time.sleep(0.002)  # Explicit synthetic 1ms recovery interval.
     return asyncio.run(svc.execute(req, ExecutionContext(requestId=req.request_id,
         userId=req.actor.user_id, organizationId=req.actor.organization_id), allow_dispatch=False, reconcile=True))
 

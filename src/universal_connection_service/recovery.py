@@ -28,6 +28,8 @@ class RecoveryContract(Model):
     lookup_timeout_ms: int = Field(alias="lookupTimeoutMs", ge=1, le=60_000)
     replay: ReplayPolicy | None = None
     dispatch_outcomes: bool = Field(alias="dispatchOutcomes", default=False)
+    recovery_backoff_ms: int = Field(alias="recoveryBackoffMs", default=1000, ge=1, le=3_600_000)
+    clock_margin_ms: int = Field(alias="clockMarginMs", default=1000, ge=1, le=60_000)
 
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(self.model_dump(mode="json", by_alias=True, exclude_defaults=True),

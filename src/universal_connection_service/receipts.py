@@ -77,6 +77,7 @@ class ExecutionReceipt(ExecutionIntent):
     version: int = Field(default=0, ge=0)
     attempt_count: int = Field(alias="attemptCount", default=0, ge=0)
     lookup_count: int = Field(alias="lookupCount", default=0, ge=0)
+    recovery_not_before: datetime | None = Field(alias="recoveryNotBefore", default=None)
     attempt_id: str | None = Field(alias="attemptId", default=None)
     result_ref: str | None = Field(alias="resultRef", default=None)
     provider_reference: str | None = Field(alias="providerReference", default=None)
@@ -85,9 +86,11 @@ class ExecutionReceipt(ExecutionIntent):
     created_at: datetime = Field(alias="createdAt", default_factory=utc_now)
     updated_at: datetime = Field(alias="updatedAt", default_factory=utc_now)
 
-    @field_validator("created_at", "updated_at")
+    @field_validator("created_at", "updated_at", "recovery_not_before")
     @classmethod
-    def aware(cls, value: datetime) -> datetime:
+    def aware(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None:
             raise ValueError("receipt timestamps must include timezone")
         return value.astimezone(timezone.utc)
@@ -129,5 +132,5 @@ class ReceiptStore(Protocol):
     def deliver_receipt_audit(self, organization_id: str, limit: int = 100) -> int: ...
     def receipt_result_page(self, after: str = "", limit: int = 10) -> list[tuple[ExecutionReceipt, str]]: ...
     def purge_receipt_result(self, organization_id: str, operation_id: str, expected_version: int, ciphertext: str) -> bool: ...
-    def begin_receipt_lookup(self, organization_id: str, operation_id: str, expected_version: int, contract_digest: str, max_lookups: int, deadline: datetime) -> ExecutionReceipt: ...
-    def begin_receipt_replay(self, organization_id: str, operation_id: str, expected_version: int, request_id: str, contract_digest: str, max_attempts: int, approval_ref_hash: str) -> ExecutionReceipt: ...
+    def begin_receipt_lookup(self, organization_id: str, operation_id: str, expected_version: int, contract_digest: str, max_lookups: int, deadline: datetime, *, backoff_ms: int = 1000) -> ExecutionReceipt: ...
+    def begin_receipt_replay(self, organization_id: str, operation_id: str, expected_version: int, request_id: str, contract_digest: str, max_attempts: int, approval_ref_hash: str, *, backoff_ms: int = 1000, clock_margin_ms: int = 1000) -> ExecutionReceipt: ...
