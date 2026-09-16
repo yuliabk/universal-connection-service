@@ -49,6 +49,11 @@ from .sandbox_managed_runtime import (
     ToolScopedSandboxedMCPConnector,
 )
 from .sandbox_policy import SandboxMountCatalog
+from .sandbox_policy_compiler import (
+    LeastPrivilegePolicyCompiler,
+    SandboxPolicyCatalog,
+    build_sandbox_policy_compiler_router,
+)
 from .sandbox_tool_policy import SandboxToolPolicyService, build_sandbox_tool_policy_router
 from .service import ConnectionService
 
@@ -124,6 +129,13 @@ def _build_mount_catalog():
         return SandboxMountCatalog.from_json(os.getenv("UCS_MCP_SANDBOX_MOUNTS_JSON"))
     except ValueError as exc:
         raise RuntimeError("UCS_MCP_SANDBOX_MOUNTS_JSON is invalid") from exc
+
+
+def _build_sandbox_policy_catalog():
+    try:
+        return SandboxPolicyCatalog.from_json(os.getenv("UCS_SANDBOX_POLICY_CATALOG_JSON"))
+    except ValueError as exc:
+        raise RuntimeError("UCS_SANDBOX_POLICY_CATALOG_JSON is invalid") from exc
 
 
 def _signing_public_key(signing_key_b64: str) -> bytes:
@@ -259,12 +271,20 @@ approval_store = state_store if isinstance(state_store, ApprovalStore) else None
 workflow_store = state_store if isinstance(state_store, WorkflowStore) else None
 approval_verifier = PersistentApprovalVerifier(approval_store) if approval_store is not None else None
 mount_catalog = _build_mount_catalog()
+sandbox_policy_catalog = _build_sandbox_policy_catalog()
 sandbox_policy_service = SandboxToolPolicyService(
     registry=registry,
     evidence_store=state_store,
     approval_store=approval_store,
     mount_catalog=mount_catalog,
     require_distinct_approver=_env_bool("UCS_CONTROL_PLANE_REQUIRE_DISTINCT_APPROVER"),
+)
+sandbox_policy_compiler = LeastPrivilegePolicyCompiler(
+    registry=registry,
+    evidence_store=state_store,
+    mount_catalog=mount_catalog,
+    policy_catalog=sandbox_policy_catalog,
+    credential_resolver=credential_resolver if isinstance(credential_resolver, AgentVaultCredentialResolver) else None,
 )
 sandbox_gateway_manager, sandbox_gateway_kind = _build_gateway_manager()
 sandbox_gateway_state = "pending" if sandbox_gateway_manager is not None else sandbox_gateway_kind
@@ -367,6 +387,7 @@ build_kind = (
     else "disabled"
 )
 sandbox_policy_kind = "per-tool-approved-profiles" if mcp_sandbox_runner is not None else "disabled"
+sandbox_policy_compiler_kind = "deterministic" if mcp_sandbox_runner is not None else "metadata-only"
 package_rehydration = RehydrationReport()
 
 
@@ -403,6 +424,7 @@ app = FastAPI(title="Universal Connection Service", version="0.1.0", lifespan=li
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
 app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_sandbox_tool_policy_router(sandbox_policy_service, control_plane_authenticator))
+app.include_router(build_sandbox_policy_compiler_router(sandbox_policy_compiler, control_plane_authenticator))
 
 
 @app.get("/health")
@@ -419,6 +441,7 @@ def health():
         "packageVerifier": package_kind,
         "packageSandbox": mcp_sandbox_kind,
         "sandboxPolicy": sandbox_policy_kind,
+        "sandboxPolicyCompiler": sandbox_policy_compiler_kind,
         "sandboxGateway": sandbox_gateway_state,
         "packages": {
             "loaded": package_rehydration.loaded,
