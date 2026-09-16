@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
+from .receipt_store import SQLReceiptStore, receipt_schema
+from .receipts import ReceiptStore
 
 from .contracts import (
     ConnectorManifest,
@@ -169,11 +172,11 @@ class WorkflowStore(Protocol):
 
 
 @runtime_checkable
-class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, WorkflowStore, Protocol):
+class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, WorkflowStore, ReceiptStore, Protocol):
     pass
 
 
-class SQLiteStateStore:
+class SQLiteStateStore(SQLReceiptStore):
     """SQLite reference store for UCS control-plane state."""
 
     def __init__(self, path: str | Path) -> None:
@@ -186,6 +189,20 @@ class SQLiteStateStore:
             if self.path != ":memory:":
                 self._connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
+            with self._connection:
+                for statement in receipt_schema():
+                    self._connection.execute(statement)
+
+    @property
+    def receipts_durable(self) -> bool:
+        return self.path not in {":memory:", ""}
+
+    @contextmanager
+    def _receipt_transaction(self):
+        # BEGIN IMMEDIATE serializes read/CAS/attempt transactions across processes.
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            yield self._connection
 
     def close(self) -> None:
         with self._lock:

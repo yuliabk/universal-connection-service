@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from pydantic import Field, SecretStr, field_validator
+from .receipt_store import SQLReceiptStore, receipt_schema
 
 from .approvals import ApprovalRecord, ApprovalStore
 from .contracts import ConnectorManifest, Lifecycle, Model
@@ -166,6 +168,12 @@ _MIGRATIONS = (
     ),
 )
 
+_MIGRATIONS += (
+    Migration(4, "durable_execution_receipts", receipt_schema("ucs_internal.") + (
+        "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
+    )),
+)
+
 LATEST_SCHEMA_VERSION = _MIGRATIONS[-1].version
 _MIGRATION_LOCK_KEY = 814434035
 
@@ -197,7 +205,7 @@ class PostgresStoreConfig(Model):
         return value
 
 
-class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore, WorkflowStore):
+class PostgresStateStore(SQLReceiptStore, ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore, WorkflowStore):
     """PostgreSQL/Supabase implementation of UCS persistent control-plane state."""
 
     def __init__(self, config: PostgresStoreConfig) -> None:
@@ -233,6 +241,20 @@ class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, Approva
 
     def close(self) -> None:
         self._pool.close()
+
+    @property
+    def receipts_durable(self) -> bool:
+        return True
+
+    def _receipt_sql(self, sql: str) -> str:
+        for table in ("execution_receipt", "execution_attempt", "execution_outbox"):
+            sql = sql.replace(table, "ucs_internal." + table)
+        return sql.replace("?", "%s")
+
+    @contextmanager
+    def _receipt_transaction(self):
+        with self._pool.connection() as conn, conn.transaction():
+            yield conn
 
     def _migration_versions(self) -> set[int]:
         with self._pool.connection() as conn:
