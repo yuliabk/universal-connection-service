@@ -21,6 +21,19 @@ from .contracts import (
 
 EvidenceKind = Literal["policy_decision", "approval_verification", "validation"]
 EvidencePhase = Literal["plan", "execution", "validation"]
+WorkflowStage = Literal[
+    "planning",
+    "awaiting_candidate_selection",
+    "awaiting_build",
+    "awaiting_credentials",
+    "awaiting_tool_selection",
+    "awaiting_promotion_approval",
+    "awaiting_promotion",
+    "awaiting_execution_approval",
+    "ready_to_execute",
+    "completed",
+    "failed",
+]
 
 
 def utc_now() -> datetime:
@@ -61,6 +74,29 @@ class AuditEvent(Model):
     error_code: str | None = Field(alias="errorCode", default=None)
     approval_ref_hash: str | None = Field(alias="approvalRefHash", default=None)
     created_at: datetime = Field(alias="createdAt", default_factory=utc_now)
+
+
+class ConnectionWorkflowRecord(Model):
+    workflow_id: str = Field(alias="workflowId", min_length=1)
+    request_id: str = Field(alias="requestId", min_length=1)
+    organization_id: str = Field(alias="organizationId", min_length=1)
+    request_fingerprint: str = Field(alias="requestFingerprint", min_length=64, max_length=64)
+    service_id: str = Field(alias="serviceId", min_length=1)
+    capability: str = Field(min_length=1)
+    operation: Operation
+    stage: WorkflowStage = "planning"
+    selected_candidate_id: str | None = Field(alias="selectedCandidateId", default=None)
+    selected_tool: str | None = Field(alias="selectedTool", default=None)
+    connector_id: str | None = Field(alias="connectorId", default=None)
+    connector_version: str | None = Field(alias="connectorVersion", default=None)
+    promotion_id: str | None = Field(alias="promotionId", default=None)
+    last_code: str | None = Field(alias="lastCode", default=None)
+    result_audit_id: str | None = Field(alias="resultAuditId", default=None)
+    revision: int = Field(default=0, ge=0)
+    lease_token: str | None = Field(alias="leaseToken", default=None, exclude=True)
+    lease_expires_at: datetime | None = Field(alias="leaseExpiresAt", default=None, exclude=True)
+    created_at: datetime = Field(alias="createdAt", default_factory=utc_now)
+    updated_at: datetime = Field(alias="updatedAt", default_factory=utc_now)
 
 
 @runtime_checkable
@@ -105,7 +141,35 @@ class AuditStore(Protocol):
 
 
 @runtime_checkable
-class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, Protocol):
+class WorkflowStore(Protocol):
+    def create_workflow(self, record: ConnectionWorkflowRecord) -> ConnectionWorkflowRecord: ...
+
+    def get_workflow(self, organization_id: str, workflow_id: str) -> ConnectionWorkflowRecord | None: ...
+
+    def get_workflow_by_request(self, organization_id: str, request_id: str) -> ConnectionWorkflowRecord | None: ...
+
+    def claim_workflow(
+        self,
+        organization_id: str,
+        workflow_id: str,
+        lease_token: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> bool: ...
+
+    def update_claimed_workflow(
+        self,
+        record: ConnectionWorkflowRecord,
+        *,
+        expected_revision: int,
+        lease_token: str,
+    ) -> bool: ...
+
+    def release_workflow(self, organization_id: str, workflow_id: str, lease_token: str) -> None: ...
+
+
+@runtime_checkable
+class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, WorkflowStore, Protocol):
     pass
 
 
@@ -199,6 +263,33 @@ class SQLiteStateStore:
 
             CREATE INDEX IF NOT EXISTS idx_approval_org_request
                 ON approval_grant (organization_id, request_id, expires_at);
+
+            CREATE TABLE IF NOT EXISTS connection_workflow (
+                workflow_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                service_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                selected_candidate_id TEXT,
+                selected_tool TEXT,
+                connector_id TEXT,
+                connector_version TEXT,
+                promotion_id TEXT,
+                last_code TEXT,
+                result_audit_id TEXT,
+                revision INTEGER NOT NULL,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (organization_id, request_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workflow_org_stage
+                ON connection_workflow (organization_id, stage, updated_at);
             """
         )
         self._connection.commit()
@@ -206,6 +297,31 @@ class SQLiteStateStore:
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _workflow_from_row(row: sqlite3.Row) -> ConnectionWorkflowRecord:
+        return ConnectionWorkflowRecord(
+            workflowId=row["workflow_id"],
+            requestId=row["request_id"],
+            organizationId=row["organization_id"],
+            requestFingerprint=row["request_fingerprint"],
+            serviceId=row["service_id"],
+            capability=row["capability"],
+            operation=row["operation"],
+            stage=row["stage"],
+            selectedCandidateId=row["selected_candidate_id"],
+            selectedTool=row["selected_tool"],
+            connectorId=row["connector_id"],
+            connectorVersion=row["connector_version"],
+            promotionId=row["promotion_id"],
+            lastCode=row["last_code"],
+            resultAuditId=row["result_audit_id"],
+            revision=row["revision"],
+            leaseToken=row["lease_token"],
+            leaseExpiresAt=datetime.fromisoformat(row["lease_expires_at"]) if row["lease_expires_at"] else None,
+            createdAt=datetime.fromisoformat(row["created_at"]),
+            updatedAt=datetime.fromisoformat(row["updated_at"]),
+        )
 
     def upsert_connector(self, record: ConnectorStateRecord) -> None:
         manifest_json = self._json(record.manifest.model_dump(by_alias=True, mode="json"))
@@ -462,3 +578,132 @@ class SQLiteStateStore:
                 (timestamp, approval_ref_hash, timestamp),
             )
             return cursor.rowcount == 1
+
+    def create_workflow(self, record: ConnectionWorkflowRecord) -> ConnectionWorkflowRecord:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO connection_workflow (
+                    workflow_id, request_id, organization_id, request_fingerprint,
+                    service_id, capability, operation, stage, selected_candidate_id,
+                    selected_tool, connector_id, connector_version, promotion_id,
+                    last_code, result_audit_id, revision, lease_token,
+                    lease_expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.workflow_id,
+                    record.request_id,
+                    record.organization_id,
+                    record.request_fingerprint,
+                    record.service_id,
+                    record.capability,
+                    record.operation,
+                    record.stage,
+                    record.selected_candidate_id,
+                    record.selected_tool,
+                    record.connector_id,
+                    record.connector_version,
+                    record.promotion_id,
+                    record.last_code,
+                    record.result_audit_id,
+                    record.revision,
+                    None,
+                    None,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+        created = self.get_workflow(record.organization_id, record.workflow_id)
+        assert created is not None
+        return created
+
+    def get_workflow(self, organization_id: str, workflow_id: str) -> ConnectionWorkflowRecord | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM connection_workflow WHERE organization_id = ? AND workflow_id = ?",
+                (organization_id, workflow_id),
+            ).fetchone()
+        return self._workflow_from_row(row) if row is not None else None
+
+    def get_workflow_by_request(self, organization_id: str, request_id: str) -> ConnectionWorkflowRecord | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM connection_workflow WHERE organization_id = ? AND request_id = ?",
+                (organization_id, request_id),
+            ).fetchone()
+        return self._workflow_from_row(row) if row is not None else None
+
+    def claim_workflow(
+        self,
+        organization_id: str,
+        workflow_id: str,
+        lease_token: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE connection_workflow
+                SET lease_token = ?, lease_expires_at = ?
+                WHERE organization_id = ? AND workflow_id = ?
+                  AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+                """,
+                (
+                    lease_token,
+                    lease_expires_at.isoformat(),
+                    organization_id,
+                    workflow_id,
+                    now.isoformat(),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def update_claimed_workflow(
+        self,
+        record: ConnectionWorkflowRecord,
+        *,
+        expected_revision: int,
+        lease_token: str,
+    ) -> bool:
+        updated_at = utc_now()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE connection_workflow
+                SET stage = ?, selected_candidate_id = ?, selected_tool = ?,
+                    connector_id = ?, connector_version = ?, promotion_id = ?,
+                    last_code = ?, result_audit_id = ?, revision = revision + 1,
+                    lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE organization_id = ? AND workflow_id = ?
+                  AND revision = ? AND lease_token = ?
+                """,
+                (
+                    record.stage,
+                    record.selected_candidate_id,
+                    record.selected_tool,
+                    record.connector_id,
+                    record.connector_version,
+                    record.promotion_id,
+                    record.last_code,
+                    record.result_audit_id,
+                    updated_at.isoformat(),
+                    record.organization_id,
+                    record.workflow_id,
+                    expected_revision,
+                    lease_token,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def release_workflow(self, organization_id: str, workflow_id: str, lease_token: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE connection_workflow
+                SET lease_token = NULL, lease_expires_at = NULL
+                WHERE organization_id = ? AND workflow_id = ? AND lease_token = ?
+                """,
+                (organization_id, workflow_id, lease_token),
+            )
