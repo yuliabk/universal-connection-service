@@ -144,6 +144,8 @@ class DurableExecutor:
             error=ConnectionError(code=code, message=code.replace("_", " ").lower(), retryable=False, userActionRequired=True))
 
     def _cached(self, req, receipt):
+        if receipt.outcome_conflicted:
+            return self._error(req, "EXECUTION_OUTCOME_CONFLICT", receipt)
         if receipt.state not in {"succeeded", "failed_no_effect"}:
             return self._error(req, "EXECUTION_PENDING" if receipt.state == "pending" else "OUTCOME_UNKNOWN", receipt,
                                unknown=receipt.state == "dispatching")
@@ -179,6 +181,20 @@ class DurableExecutor:
             providerAccountId=receipt.provider_account_id, bindingDigest=receipt.binding_digest,
             contractDigest=receipt.recovery_contract_digest, notAfter=receipt.provider_not_after)
 
+    def _complete_final(self, receipt, state, sealed):
+        try:
+            return self.store.complete_receipt(receipt.organization_id, receipt.operation_id,
+                receipt.version, state, result_ciphertext=sealed)
+        except ReceiptError as exc:
+            if exc.code != "RECEIPT_STATE_CONFLICT":
+                raise
+            try:
+                return self.store.quarantine_conflicting_outcome(receipt.organization_id, receipt.operation_id, state)
+            except ReceiptError:
+                raise
+            except Exception:
+                raise ReceiptError("OUTCOME_CONFLICT_CHECK_UNAVAILABLE") from None
+
     def _store_provider_outcome(self, req, target, receipt, outcome):
         if isinstance(outcome, ProviderOutcome):
             outcome = ProviderOutcome.model_validate(outcome.model_dump())
@@ -191,8 +207,7 @@ class DurableExecutor:
                 receipt.version, "pending" if outcome.state == "pending" else "unknown")
         else:
             sealed = self.cipher.seal(receipt, outcome.result, target.result_retention_seconds)
-            receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id,
-                receipt.version, outcome.state, result_ciphertext=sealed)
+            receipt = self._complete_final(receipt, outcome.state, sealed)
         return self._cached(req, receipt)
 
     async def _dispatch_result(self, req, ctx, registration, target, receipt, contract):
@@ -216,8 +231,7 @@ class DurableExecutor:
             receipt = self.store.mark_unresolved(receipt.organization_id, receipt.operation_id, receipt.version, "unknown")
             return self._error(req, "OUTCOME_UNKNOWN", receipt)
         sealed = self.cipher.seal(receipt, result, target.result_retention_seconds)
-        receipt = self.store.complete_receipt(receipt.organization_id, receipt.operation_id, receipt.version,
-                                              "succeeded", result_ciphertext=sealed)
+        receipt = self._complete_final(receipt, "succeeded", sealed)
         return self._cached(req, receipt)
 
     async def _replay(self, req, ctx, registration, target, receipt):
@@ -245,7 +259,9 @@ class DurableExecutor:
             return await self._dispatch_result(req, ctx, registration, target, receipt, contract)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, ReceiptError) and exc.code == "OUTCOME_CONFLICT_CHECK_UNAVAILABLE":
+                return self._error(req, exc.code, receipt)
             current = self.store.get_receipt(receipt.organization_id, receipt.operation_id)
             if current and current.state in {"succeeded", "failed_no_effect"}:
                 return self._cached(req, current)
@@ -273,6 +289,8 @@ class DurableExecutor:
             raise
         except Exception as exc:
             # A competing lookup may have completed; never execute to recover.
+            if isinstance(exc, ReceiptError) and exc.code == "OUTCOME_CONFLICT_CHECK_UNAVAILABLE":
+                return self._error(req, exc.code, receipt)
             current = self.store.get_receipt(receipt.organization_id, receipt.operation_id)
             if current and current.state in {"succeeded", "failed_no_effect"}:
                 return self._cached(req, current)

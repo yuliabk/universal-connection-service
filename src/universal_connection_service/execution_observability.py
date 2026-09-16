@@ -9,6 +9,7 @@ NOTICE_CODES = frozenset({
     "RECOVERY_BUDGET_EXHAUSTED", "REPLAY_BUDGET_EXHAUSTED", "RECOVERY_BACKOFF_REQUIRED",
     "RECOVERY_CONTRACT_MISMATCH", "RECOVERY_OUTCOME_MISMATCH", "REPLAY_NOT_CONFIGURED",
     "APPROVAL_REVOKED", "APPROVAL_EXPIRED", "EXECUTION_RESTORE_QUARANTINED",
+    "EXECUTION_OUTCOME_CONFLICT",
 })
 
 
@@ -29,12 +30,15 @@ class ExecutionObservabilityStore:
     _receipt_created_expression = "json_extract(receipt_json, '$.createdAt')"
 
     def record_execution_notice(self, organization_id, receipt_id, code):
+        with self._receipt_transaction() as conn:
+            self._record_execution_notice(conn, organization_id, receipt_id, code)
+
+    def _record_execution_notice(self, conn, organization_id, receipt_id, code):
         if code not in NOTICE_CODES:
             raise ValueError("unsupported execution notice")
         now = utc_now().isoformat()
-        with self._receipt_transaction() as conn:
-            # Do not create an orphan or accept a receipt from another tenant.
-            self._receipt_query(conn, """INSERT INTO execution_notice
+        # Do not create an orphan or accept a receipt from another tenant.
+        self._receipt_query(conn, """INSERT INTO execution_notice
                 (organization_id, receipt_id, code, notice_id, first_seen, last_seen, observations)
                 SELECT organization_id, receipt_id, ?, ?, ?, ?, 1 FROM execution_receipt
                 WHERE organization_id = ? AND receipt_id = ?

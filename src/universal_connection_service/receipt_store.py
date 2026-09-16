@@ -271,6 +271,22 @@ class SQLReceiptStore(ExecutionObservabilityStore):
                 """, (organization_id, event.event_id, operation_id, event.model_dump_json()))
             return receipt
 
+    def quarantine_conflicting_outcome(self, organization_id, operation_id, observed_state):
+        if observed_state not in {"succeeded", "failed_no_effect"}:
+            raise ValueError("only authoritative final outcomes can conflict")
+        with self._receipt_transaction() as conn:
+            # Serialize against completion and other conflict reports in PostgreSQL.
+            self._receipt_query(conn, """UPDATE execution_receipt SET version = version
+                WHERE organization_id = ? AND operation_id = ?""", (organization_id, operation_id))
+            receipt = self._load_receipt(conn, organization_id, operation_id)
+            if receipt is None or receipt.state not in {"succeeded", "failed_no_effect"}:
+                raise ReceiptError("RECEIPT_STATE_CONFLICT")
+            if receipt.state != observed_state and not receipt.outcome_conflicted:
+                receipt.outcome_conflicted = True
+                self._save(conn, receipt, receipt.version)
+                self._record_execution_notice(conn, organization_id, receipt.receipt_id, "EXECUTION_OUTCOME_CONFLICT")
+            return receipt
+
     def get_receipt_result(self, organization_id: str, operation_id: str) -> str | None:
         with self._receipt_transaction() as conn:
             row = self._receipt_query(conn, """SELECT ciphertext FROM execution_result

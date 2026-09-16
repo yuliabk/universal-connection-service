@@ -78,6 +78,7 @@ class ExecutionReceipt(ExecutionIntent):
     attempt_count: int = Field(alias="attemptCount", default=0, ge=0)
     lookup_count: int = Field(alias="lookupCount", default=0, ge=0)
     recovery_not_before: datetime | None = Field(alias="recoveryNotBefore", default=None)
+    outcome_conflicted: bool = Field(alias="outcomeConflicted", default=False)
     attempt_id: str | None = Field(alias="attemptId", default=None)
     result_ref: str | None = Field(alias="resultRef", default=None)
     provider_reference: str | None = Field(alias="providerReference", default=None)
@@ -117,6 +118,7 @@ class ReceiptAudit(Model):
 
 @runtime_checkable
 class ReceiptStore(Protocol):
+    def quarantine_conflicting_outcome(self, organization_id: str, operation_id: str, observed_state: str) -> ExecutionReceipt: ...
     def record_execution_notice(self, organization_id: str, receipt_id: str, code: str) -> None: ...
     def execution_notices(self, organization_id: str, *, after: str = "", limit: int = 100) -> list[dict]: ...
     def execution_metrics(self, organization_id: str) -> dict: ...
