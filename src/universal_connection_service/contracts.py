@@ -48,6 +48,23 @@ class RiskAssessment(Model):
     financial: bool = False
     permission_increase: bool = Field(alias="permissionIncrease", default=False)
 
+class DiscoveryCandidateRef(Model):
+    candidate_id: str = Field(alias="candidateId", min_length=1)
+    source: Literal["mcp_registry", "local_catalog", "openapi"]
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    strategy: Literal["mcp", "api"]
+    transport: str | None = None
+    endpoint: str | None = None
+    package_registry: str | None = Field(alias="packageRegistry", default=None)
+    package_identifier: str | None = Field(alias="packageIdentifier", default=None)
+    package_version: str | None = Field(alias="packageVersion", default=None)
+    package_sha256: str | None = Field(alias="packageSha256", default=None)
+    auth_requirement: AuthRequirement = Field(alias="authRequirement", default_factory=AuthRequirement)
+    confidence: int = Field(default=0, ge=0, le=100)
+    actionable: bool = False
+    requires_build: bool = Field(alias="requiresBuild", default=False)
+
 class ConnectionPlan(Model):
     plan_id: str = Field(alias="planId")
     request_id: str = Field(alias="requestId")
@@ -62,6 +79,9 @@ class ConnectionPlan(Model):
     requires_human_approval: bool = Field(alias="requiresHumanApproval")
     policy_decision: PolicyDecision = Field(alias="policyDecision", default="ALLOW")
     policy_reasons: tuple[str, ...] = Field(alias="policyReasons", default=())
+    discovery_candidates: tuple[DiscoveryCandidateRef, ...] = Field(alias="discoveryCandidates", default=())
+    selected_discovery_candidate_id: str | None = Field(alias="selectedDiscoveryCandidateId", default=None)
+    requires_selection: bool = Field(alias="requiresSelection", default=False)
 
 class ConnectorManifest(Model):
     connector_id: str = Field(alias="connectorId")
