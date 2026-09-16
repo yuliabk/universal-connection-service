@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from uuid import uuid4
 
 from pydantic import Field
 
-from .contracts import Model
+from .contracts import ConnectorContract, Model
 from .packages import ConnectorPackageLoader, PackageVerificationError
 from .persistence import ConnectorStateStore, EvidenceRecord, EvidenceStore
 from .registry import ConnectorRegistry, Registration
@@ -59,6 +60,9 @@ class ConnectorPackagePinService:
         )
 
 
+RuntimeConnectorBinder = Callable[[ConnectorContract], ConnectorContract]
+
+
 class ConnectorRuntimeRehydrator:
     """Rebuild runtime registry from trusted state and pinned signed packages."""
 
@@ -69,17 +73,16 @@ class ConnectorRuntimeRehydrator:
         evidence_store: EvidenceStore,
         registry: ConnectorRegistry,
         loader: ConnectorPackageLoader,
+        runtime_binder: RuntimeConnectorBinder | None = None,
     ) -> None:
         self.state_store = state_store
         self.evidence_store = evidence_store
         self.registry = registry
         self.loader = loader
+        self.runtime_binder = runtime_binder
 
     def _pin_for(self, organization_id: str, connector_id: str, version: str):
-        evidence = self.evidence_store.list_evidence(
-            organization_id,
-            kind="validation",
-        )
+        evidence = self.evidence_store.list_evidence(organization_id, kind="validation")
         matches = [
             item
             for item in evidence
@@ -119,19 +122,24 @@ class ConnectorRuntimeRehydrator:
             try:
                 pin = self._pin_for(record.organization_id, connector_id, version)
                 if pin is None:
-                    raise PackageVerificationError(
-                        "PACKAGE_PIN_MISSING",
-                        "Trusted connector has no verified package pin",
-                    )
+                    raise PackageVerificationError("PACKAGE_PIN_MISSING", "Trusted connector has no verified package pin")
                 loaded = self.loader.load(pin.payload["digest"])
                 if loaded.manifest.connector != record.manifest:
                     raise PackageVerificationError(
                         "PACKAGE_TRUST_MISMATCH",
                         "Signed package metadata does not match persistent trusted metadata",
                     )
+                connector = loaded.connector
+                if self.runtime_binder is not None:
+                    connector = self.runtime_binder(connector)
+                if connector.manifest() != record.manifest:
+                    raise PackageVerificationError(
+                        "PACKAGE_RUNTIME_BINDING_MISMATCH",
+                        "Runtime dependency binding changed connector metadata",
+                    )
                 self.registry.register(
                     Registration(
-                        connector=loaded.connector,
+                        connector=connector,
                         status="trusted",
                         organization_id=record.organization_id,
                     )
