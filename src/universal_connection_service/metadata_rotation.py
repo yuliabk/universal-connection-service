@@ -27,7 +27,9 @@ class RotationBatch:
 
 
 def rotate_metadata_batch(repository, *, cursor=None, limit=100, verify_only=False):
-    """Authenticate at most limit envelopes and return a resumable opaque cursor.
+    """Process at most limit selected records and return a resumable opaque cursor.
+
+    Document batches also authenticate their tenant directory and the profile.
 
     key_counts describes the keys of authenticated envelopes AFTER this batch.
     None cursor means this pass reached its end, not proof against stale writers

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_metadata_storage import repositories, stores, cipher, PROFILE
+from test_metadata_storage import repositories, cipher
 from test_encrypted_receipt_store import encrypted_stores
 from test_durable_execution import request, approve, build_service, execute
 from universal_connection_service.metadata_storage import MetadataRepository
@@ -10,6 +10,43 @@ from universal_connection_service.metadata_rotation import rotate_metadata_batch
 from universal_connection_service.metadata_crypto import MetadataCryptoError
 from universal_connection_service.encrypted_receipt_store import EncryptedStateStore
 from universal_connection_service.encrypted_witness import EncryptedDispatchWitness
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def stores(request, tmp_path):
+    # Rotation changes a whole profile, so tenant-level fixture isolation is
+    # insufficient. Never rotate the shared PostgreSQL regression database.
+    import os
+    from uuid import uuid4
+    from universal_connection_service.persistence import SQLiteStateStore
+    opened = []
+    postgres = request.param == "postgres"
+    if postgres:
+        dsn = os.getenv("UCS_TEST_POSTGRES_URL")
+        if not dsn:
+            pytest.skip("PostgreSQL not configured")
+        import psycopg
+        from psycopg import sql
+        from psycopg.conninfo import make_conninfo
+        from pydantic import SecretStr
+        from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
+        database = "ucs_rotation_test_" + uuid4().hex
+        with psycopg.connect(dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+        isolated_dsn = make_conninfo(dsn, dbname=database)
+    def factory():
+        store = (PostgresStateStore(PostgresStoreConfig(dsn=SecretStr(isolated_dsn), sslmode="disable", autoMigrate=True))
+                 if postgres else SQLiteStateStore(tmp_path / "rotation.sqlite3"))
+        opened.append(store)
+        return store
+    try:
+        yield factory
+    finally:
+        for store in opened:
+            store.close()
+        if postgres:
+            with psycopg.connect(dsn, autocommit=True) as admin:
+                admin.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
 
 
 def new_cipher(*, retire=False):

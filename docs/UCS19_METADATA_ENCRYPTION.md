@@ -22,12 +22,12 @@
 2. witness נפרד מחובר לפורמט המוצפן, כולל provisioning וטעינה ב־runtime, בלי לשנות receiptId, providerKey, attemptCount או binding.
 3. runtime דורש profiles ומפתחות מאומתים. תצורה חלקית, מפתח חסר או נתוני legacy נחסמים לפני dispatch; אין fallback למסד חדש או לאחסון גלוי.
 4. להוסיף מעבר offline לנתונים קיימים: לעצור writers, להעתיק ליעד מוצפן חדש, לאמת ספירות וזהויות והיכולת לפענח את כל סוגי הרשומות, ולהפעיל רק כאשר primary ו־witness תואמים. אין לייצר מזהים חדשים או לבצע פעולות ספק בעת ההעברה. המסד הישן, WAL וגיבויים נותרים עותקים רגישים עד טיפול נפרד בפריסה.
-5. להוסיף re-encryption מוגבל באצוות עם CAS ומעקב אחר key IDs, בלי מחיקת tombstones ובלי הרחבת חלון replay.
-6. להריץ את מטריצת הקריסה, worker stale, audit outage, restart, concurrency ובידוד עם האחסון המוצפן בשני backends. לבדוק קריאה ישירה של כל טבלאות היעד, כולל witness, ולוודא שמזהים ותוכן סינתטיים אינם מופיעים בהם בטקסט.
+5. re-encryption באצוות מומש עם CAS ומעקב אחר key IDs, בלי מחיקת tombstones ובלי הרחבת חלון replay; יש להשלים את אימות CI.
+6. מטריצת הקריסה, worker stale, audit outage, restart, concurrency ובידוד עברו עם האחסון המוצפן בשני backends. בדיקות קריאה ישירה בודקות היעדר מזהים ותוכן סינתטיים בטבלאות היעד, כולל witness.
 
 ## גבולות הראיה הנוכחית
 
-בדיקות `test_metadata_crypto.py` בודקות tenant/AAD, tampering, framing של אינדקסים, תצורה פגומה ו־rotation. `test_metadata_storage.py` בודקות restart, CAS בין מופעים, rollback של שני מסמכים, pagination, מפתחות שגויים וקריאה ישירה במסד. ה־bodies בבדיקת rollback מייצגים approval ו־receipt; אין זו עדיין בדיקת coordinator אמיתי עם האחסון המוצפן.
+בדיקות `test_metadata_crypto.py` בודקות tenant/AAD, tampering, framing של אינדקסים, תצורה פגומה ו־rotation. `test_metadata_storage.py` בודקות restart, CAS בין מופעים, rollback של שני מסמכים, pagination, מפתחות שגויים וקריאה ישירה במסד. אלה בדיקות שכבת האחסון; בדיקות coordinator ותהליכים אמיתיים מפורטות בהמשך.
 
 העלות הצפויה היא הצפנה/פענוח לכל גישה, directory מוצפן וכתיבות נוספות עבור lookup aliases. סריקות תפעוליות יעברו באצוות לפי tenant; אין להעמיס את כל המסד לזיכרון כדי לשמר את ממשק SQL הישן. מפתח האינדקס הוא סוד ארוך־חיים; אובדנו מחייב שחזור מפתח או migration מאומת ואינו הרשאה לפתוח keyspace חדש.
 
@@ -49,7 +49,7 @@
 
 גם notices, תקציבי recovery, backoff, quarantine ותצפית תפעולית משתמשים במסמכים מוצפנים. רשימות שומרות על סדר המזהים וה־cursor של הממשק הישן באמצעות פענוח באצוות ובחירת התוצאות המוגבלות בזיכרון; זמן הסריקה אינו מוגבל לגודל הדף המוחזר. כך נשמרת התאימות בלי לחשוף timestamps או מזהים באינדקסים גלויים, במחיר קריאות ופענוחים נוספים.
 
-הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; migration וכל מטריצת הקריסה בתהליכים נפרדים על שני האחסונים המוצפנים עדיין נדרשים.
+הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; מטריצת הקריסה בתהליכים נפרדים עברה כמפורט בהמשך; migration עדיין נדרש.
 
 ## witness מוצפן ועצמאי
 
@@ -57,7 +57,7 @@
 
 provisioning מתאפשר רק באזור מוצפן ריק, ללא נתוני primary קיימים או טבלאות witness ישנות. הוא אינו כלי migration או איפוס. identity נבדקת בכל טרנזקציה, ואיסור שיתוף מסד עם primary נשמר גם כשה־primary הוא EncryptedStateStore.
 
-בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. מעבר offline וראיות קריסה בתהליכים נפרדים כשההצפנה פעילה עדיין נדרשים.
+בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. ראיות קריסה בתהליכים נפרדים כשההצפנה פעילה נוספו כמפורט בהמשך; מעבר offline עדיין נדרש.
 
 ## הפעלה דרך runtime ואתחול מרחב חדש
 
@@ -95,3 +95,13 @@ RotationBatch מחזיר cursor להמשך, scanned, changed ו־key_counts של
 ה־repositories זמינים בממשק התחזוקה של store.repository ושל executor.witness.repository; אין endpoint ציבורי לסריקה או rotation. מפתחות ResultCipher הפנימיים נפרדים ואינם מוחלפים במהלך זה. גיבויים, WAL ועותקים ישנים עדיין עשויים להזדקק למפתחות קודמים. מעבר מוצלח אינו אישור למחוק מפתחות גיבוי.
 
 בדיקות test_metadata_rotation.py מכסות מעבר של receipt ו־witness תוך שמירת retry יחיד ואירוע audit, עצירה וחידוש, סריקת אימות ללא כתיבה ו־rollback של אצווה בעקבות ciphertext פגום או CAS שנכשל.
+
+## חוזה מעבר offline לנתונים קיימים — למימוש
+
+המעבר יעתיק זוג מקורות legacy לזוג יעדים חדשים בעלי profiles ומפתחות מוגדרים מראש. המפעיל חייב לעצור ולנקז writers, כולל קריאות ספק בתהליך, לפני צילום הנתונים. נעילת מסד אינה מבטלת קריאה חיצונית שכבר יצאה. אין לבצע migration על המקור עצמו, להחליף witness identity או לפתוח keyspace ריק במקום זה שנשמר.
+
+יעדי ההעתקה יסומנו כלא מאומתים לפני כתיבת הרשומה הראשונה. ה־runtime יחסום יעד במצב זה. יש לשמר receiptId, operationId, providerKey, binding, approval hashes ומצב צריכה/ביטול, attempt IDs, outbox event IDs ומצב מסירה, notices, גרסאות ומועדי retention/recovery. leases של workflow יישמרו כנתונים ולא יהפכו להרשאה לתהליך חדש. aliases ואינדקסים מוצפנים ייבנו מאותה זהות מקורית.
+
+הכלי יאמת ספירות לכל סוג, קריאה ופענוח מלאים מהיעדים והתאמה למקור. הוא יבדוק את זהות ה־witness ואת התאמת היסטוריית dispatch ל־receipts, לרבות עדות ללא receipt. אי התאמה תחסום הפעלה ותשאיר את המקורות ללא שינוי. סימון הצלחה יתבצע רק אחרי אימות שני היעדים; כשל בין סימוני הסיום לא יאפשר הפעלת זוג חלקי. אין צורך בקריאת ספק ואין שליחה או replay במהלך העברה.
+
+בדיקות הקבלה למעבר: פעולה שהצליחה לפני ההעברה נשלפת באותו receipt בלי השפעה נוספת; unknown/pending נשארים חסומים לביצוע חדש; outbox שנמסר אינו יוצר audit נוסף; אישור שנצרך/בוטל לא חוזר להיות זמין; retention tombstones וזהות witness נשמרים; כשל באמצע ההעתקה או אימות פגום חוסם startup; ומקורות, WAL וגיבויים אינם נמחקים אוטומטית. יש להריץ אותם בשני backends עם נתונים סינתטיים.
