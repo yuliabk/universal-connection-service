@@ -23,8 +23,8 @@
 
 ## ראיות הריצה העדכניות
 
-- הרגרסיה המקומית אחרי חיבור runtime מוצפן ותיקוני תחרות: 362 עברו, 183 דולגו בשל היעדר PostgreSQL/Docker; אזהרת deprecation אחת בתלות Starlette.
-- [CI ב־6654fb1](https://github.com/yuliabk/universal-connection-service/actions/runs/35159377071): כל 524 הבדיקות עברו ללא דילוגים, כולל PostgreSQL 16 ו־Docker; גם בניית wheel וטעינת האפליקציה ממנו עברו. ראיה זו קודמת לחיבור runtime הנוכחי, שממתין לריצת CI חדשה.
+- הרגרסיה המקומית אחרי חיבור runtime מוצפן ותיקוני תחרות: 372 עברו, 193 דולגו בשל היעדר PostgreSQL/Docker; אזהרת deprecation אחת בתלות Starlette.
+- [CI ב־aca37d5](https://github.com/yuliabk/universal-connection-service/actions/runs/35173044282): כל 545 הבדיקות עברו ללא דילוגים, כולל PostgreSQL 16 ו־Docker; גם בניית wheel וטעינת האפליקציה ממנו עברו. ראיה זו כוללת את ה־runtime המוצפן. מטריצת הקריסה המוצפנת החדשה ממתינה לריצת CI נוספת.
 - נוספו בדיקות אתחול מוצפן, provisioning ללא איפוס זהויות, ושחזור דטרמיניסטי של השלמת פעולה בין קריאת primary לבדיקת witness. הצעת מדיניות נבחרת לפי workflowRevision כדי להימנע מהחזרת הצעה ישנה כאשר חותמות הזמן זהות.
 - fixtures משתמשים בנתונים סינתטיים ובספק עם ledger עצמאי. הם אינם מוכיחים חוזה של ספק Production, RPO/RTO או הפרדת failure domains בפריסה.
 

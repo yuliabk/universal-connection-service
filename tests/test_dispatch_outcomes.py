@@ -110,7 +110,7 @@ def test_process_exit_after_pending_commit_recovers_by_lookup(stores, tmp_path):
 
     initial = stores()
     req = request()
-    backend = "sqlite" if isinstance(initial, SQLiteStateStore) else "postgres"
+    backend = "postgres" if hasattr(initial, "config") else "sqlite"
     location = initial.path if backend == "sqlite" else "postgres"
     witness = str(location) + ".witness.sqlite3" if backend == "sqlite" else str(initial.test_witness_path)
     ledger = tmp_path / "provider.sqlite3"
@@ -120,14 +120,8 @@ sys.path.insert(0, sys.argv[1])
 from test_execution_recovery import *
 from universal_connection_service.contracts import ConnectionRequest
 req = ConnectionRequest.model_validate_json(sys.argv[4])
-if sys.argv[5] == 'sqlite':
-    store = SQLiteStateStore(sys.argv[2])
-else:
-    from pydantic import SecretStr
-    from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
-    store = PostgresStateStore(PostgresStoreConfig(
-        dsn=SecretStr(os.environ['UCS_TEST_POSTGRES_URL']), sslmode='disable'))
-    store.test_witness_path = sys.argv[6]
+from process_store_helpers import open_process_store
+store = open_process_store(sys.argv[2], sys.argv[5], sys.argv[6])
 recovery = contract().model_copy(update={'dispatch_outcomes': True})
 class AcceptedProvider(FileProvider):
     async def execute_keyed(self, capability, input, ctx, key):

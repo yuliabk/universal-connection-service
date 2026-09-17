@@ -200,7 +200,7 @@ class FileProvider(Provider):
 def test_process_crash_after_provider_commit_then_keyed_lookup_recovers(tmp_path, stores):
     req = request()
     initial = stores()
-    backend = "sqlite" if isinstance(initial, SQLiteStateStore) else "postgres"
+    backend = "postgres" if hasattr(initial, "config") else "sqlite"
     store_path = initial.path if backend == "sqlite" else "postgres"
     witness_path = str(store_path) + ".witness.sqlite3" if backend == "sqlite" else str(initial.test_witness_path)
     provider_path = tmp_path / "provider.sqlite3"
@@ -210,14 +210,8 @@ sys.path.insert(0, sys.argv[1])
 from test_execution_recovery import *
 from universal_connection_service.contracts import ConnectionRequest
 req = ConnectionRequest.model_validate_json(sys.argv[4])
-if sys.argv[5] == "sqlite":
-    store = SQLiteStateStore(sys.argv[2])
-else:
-    from pydantic import SecretStr
-    from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
-    store = PostgresStateStore(PostgresStoreConfig(
-        dsn=SecretStr(os.environ["UCS_TEST_POSTGRES_URL"]), sslmode="disable"))
-    store.test_witness_path = sys.argv[6]
+from process_store_helpers import open_process_store
+store = open_process_store(sys.argv[2], sys.argv[5], sys.argv[6])
 recovery = contract()
 provider = FileProvider(recovery, sys.argv[3])
 target = make_target(req).model_copy(update={"recovery": recovery})

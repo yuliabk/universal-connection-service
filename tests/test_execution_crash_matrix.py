@@ -33,14 +33,8 @@ from test_execution_crash_matrix import *
 from test_durable_execution import approve
 from universal_connection_service.contracts import ConnectionRequest
 req = ConnectionRequest.model_validate_json(sys.argv[4])
-if sys.argv[5] == 'sqlite':
-    store = SQLiteStateStore(sys.argv[2])
-else:
-    from pydantic import SecretStr
-    from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
-    store = PostgresStateStore(PostgresStoreConfig(
-        dsn=SecretStr(os.environ['UCS_TEST_POSTGRES_URL']), sslmode='disable'))
-    store.test_witness_path = sys.argv[6]
+from process_store_helpers import open_process_store
+store = open_process_store(sys.argv[2], sys.argv[5], sys.argv[6])
 phase = sys.argv[7]
 method = {'before_intent': 'prepare_receipt', 'after_intent': 'prepare_receipt',
           'after_dispatch': 'begin_dispatch', 'after_result': 'complete_receipt'}.get(phase)
@@ -70,7 +64,7 @@ os._exit(42)
 def test_crash_boundary_never_duplicates_provider_effect(stores, tmp_path, phase):
     initial = stores()
     req = request()
-    backend = "sqlite" if isinstance(initial, SQLiteStateStore) else "postgres"
+    backend = "postgres" if hasattr(initial, "config") else "sqlite"
     location = initial.path if backend == "sqlite" else "postgres"
     witness = str(location) + ".witness.sqlite3" if backend == "sqlite" else str(initial.test_witness_path)
     ledger = tmp_path / "provider.sqlite3"

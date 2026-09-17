@@ -18,9 +18,9 @@
 
 ## שילוב שנותר לביצוע
 
-1. ממשקי StateStore חוברו למאגר המסמכים המוצפן תוך שימור טרנזקציה יחידה לצריכת approval ו־dispatch ול־result/outbox; נותר להפעילם דרך תצורת runtime מאומתת. אין לפרש SQL באופן גנרי כדי לנחש אילו ערכים להצפין.
-2. witness נפרד חובר לפורמט המוצפן בלי לשנות receiptId, providerKey, attemptCount או binding; נותר לחבר provisioning וטעינה ב־runtime. profile ומפתחות של primary ושל witness חייבים להיבדק לפני IO.
-3. להוסיף runtime configuration מפורש עם secrets ממנגנון המארח. תצורה חלקית, מפתח חסר או ניסיון לפתוח store מוצפן במצב רגיל חייבים להיכשל לפני dispatch; אין fallback שקט למסד חדש או לאחסון לא מוצפן.
+1. ממשקי StateStore מחוברים למאגר המסמכים המוצפן ול־runtime תוך שימור טרנזקציה יחידה לצריכת approval ו־dispatch ול־result/outbox. אין פירוש SQL גנרי כדי לנחש אילו ערכים להצפין.
+2. witness נפרד מחובר לפורמט המוצפן, כולל provisioning וטעינה ב־runtime, בלי לשנות receiptId, providerKey, attemptCount או binding.
+3. runtime דורש profiles ומפתחות מאומתים. תצורה חלקית, מפתח חסר או נתוני legacy נחסמים לפני dispatch; אין fallback למסד חדש או לאחסון גלוי.
 4. להוסיף מעבר offline לנתונים קיימים: לעצור writers, להעתיק ליעד מוצפן חדש, לאמת ספירות וזהויות והיכולת לפענח את כל סוגי הרשומות, ולהפעיל רק כאשר primary ו־witness תואמים. אין לייצר מזהים חדשים או לבצע פעולות ספק בעת ההעברה. המסד הישן, WAL וגיבויים נותרים עותקים רגישים עד טיפול נפרד בפריסה.
 5. להוסיף re-encryption מוגבל באצוות עם CAS ומעקב אחר key IDs, בלי מחיקת tombstones ובלי הרחבת חלון replay.
 6. להריץ את מטריצת הקריסה, worker stale, audit outage, restart, concurrency ובידוד עם האחסון המוצפן בשני backends. לבדוק קריאה ישירה של כל טבלאות היעד, כולל witness, ולוודא שמזהים ותוכן סינתטיים אינם מופיעים בהם בטקסט.
@@ -77,3 +77,9 @@ python -m universal_connection_service.storage_runtime --role witness --sqlite-p
 ב־PostgreSQL מחליפים את --sqlite-path ב־--postgres-env עם שם משתנה סביבה שמכיל DSN של מסד ריק שכבר נוצר. פקודת provisioning מריצה את מיגרציות הסכימה; נדרשת עבורה הרשאת DDL. היא אינה מאתחלת profile קיים ואינה משמשת לעקיפת quarantine. כשל provisioning יכול להשאיר קובץ חדש ריק/חלקי לבדיקה, אך startup לא ישתמש בו ללא profile ו־witness תקינים.
 
 runtime דוחה טבלאות legacy שמכילות נתונים, גם אם לצדן קיים profile מוצפן תקין. הוא גם דוחה מסד witness המשמש כ־primary. זה שינוי מכוון מהפעלת UCS_STATE_DB_PATH לבדה: אין fallback לכתיבה גלויה ואין אימוץ אוטומטי של keyspace ישן. נתונים קיימים דורשים מעבר offline שעדיין בבנייה; אין למחוק אותם כדי לעבור את בדיקת האתחול.
+
+## מטריצת קריסה מוצפנת בתהליכים נפרדים
+
+`test_encrypted_execution_process.py` מריץ את תרחישי הקריסה הקיימים גם מול EncryptedStateStore ו־EncryptedDispatchWitness. תהליכי הבדיקה פותחים profiles קיימים ואינם מאתחלים או מאפסים אותם. ה־ledger של הספק נמצא בקובץ נפרד ונבדק אחרי מות התהליך.
+
+התרחישים כוללים עצירה לפני/אחרי intent, אחרי dispatch, אחרי witness, אחרי result ו־audit acknowledgement; קריסה מיד אחרי commit אצל הספק; pending עמיד; ותהליך ישן שנעצר לפני או אחרי השפעת הספק בזמן שתהליך נוסף מבצע replay מוגן. נבדקים מספר ההשפעות, זהות התוצאה, outbox והיעדר דריסת תוצאה סופית. מקומית עברו כל עשרת התרחישים ב־SQLite; וריאציות PostgreSQL רצות ב־CI.

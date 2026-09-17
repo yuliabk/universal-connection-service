@@ -21,14 +21,8 @@ from test_execution_replay import *
 from universal_connection_service.contracts import ConnectionRequest
 from universal_connection_service.persistence import SQLiteStateStore
 req = ConnectionRequest.model_validate_json(sys.argv[4])
-if sys.argv[5] == 'sqlite':
-    store = SQLiteStateStore(sys.argv[2])
-else:
-    from pydantic import SecretStr
-    from universal_connection_service.postgres_store import PostgresStateStore, PostgresStoreConfig
-    store = PostgresStateStore(PostgresStoreConfig(
-        dsn=SecretStr(os.environ['UCS_TEST_POSTGRES_URL']), sslmode='disable'))
-    store.test_witness_path = sys.argv[6]
+from process_store_helpers import open_process_store
+store = open_process_store(sys.argv[2], sys.argv[5], sys.argv[6])
 recovery = replay_contract()
 class SuspendedProvider(DeduplicatingProvider):
     async def execute_keyed(self, capability, input, ctx, key):
@@ -57,7 +51,7 @@ def test_live_old_process_cannot_overwrite_replay_or_duplicate_effect(stores, tm
     initial = stores()
     req = request()
     raw = approve(initial, req, raw=req.actor.organization_id)
-    backend = "sqlite" if isinstance(initial, SQLiteStateStore) else "postgres"
+    backend = "postgres" if hasattr(initial, "config") else "sqlite"
     location = initial.path if backend == "sqlite" else "postgres"
     witness = str(location) + ".witness.sqlite3" if backend == "sqlite" else str(initial.test_witness_path)
     provider_path = tmp_path / "provider.sqlite3"
