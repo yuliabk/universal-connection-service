@@ -97,6 +97,18 @@ class ConnectorRegistry:
             ),
         )[-1]
 
+    def registrations(self, organization_id: str | None = None) -> tuple[Registration, ...]:
+        """Live registrations, for background work such as drift verification.
+
+        Returns the runtime objects rather than manifests, because a caller that
+        acts on a connector (re-introspecting it, demoting it) needs the
+        registration itself.
+        """
+        if organization_id is None:
+            return tuple(self._items.values())
+        allowed = {GLOBAL_ORGANIZATION, organization_id}
+        return tuple(item for item in self._items.values() if item.organization_id in allowed)
+
     def manifests(self, organization_id: str | None = None):
         allowed_organizations = {GLOBAL_ORGANIZATION}
         if organization_id is not None:
