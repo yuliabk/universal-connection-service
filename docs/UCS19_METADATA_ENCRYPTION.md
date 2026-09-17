@@ -1,6 +1,6 @@
 # UCS-19 — השלמת הצפנת metadata
 
-מצב: תשתית ההצפנה חוברה לממשקי StateStore. גם ה־witness חובר לאחסון מוצפן עצמאי. ה־runtime מחייב תצורת הצפנה ומסדים שהוכנו מראש. מעבר נתונים קיימים טרם הושלם. אין לטעון שהפעלת UCS הקיימת מצפינה metadata רק משום שמיגרציה 7 הותקנה.
+מצב: תשתית ההצפנה חוברה לממשקי StateStore. גם ה־witness חובר לאחסון מוצפן עצמאי. ה־runtime מחייב תצורת הצפנה ומסדים שהוכנו מראש. מעבר offline לנתונים קיימים מומש ב־SDK ובפקודת תחזוקה; בדיקות SQLite עברו ואימות PostgreSQL ב־CI נותר להשלמה. אין לטעון שהפעלת UCS הקיימת מצפינה metadata רק משום שמיגרציה 7 הותקנה.
 
 ## החלטת עבודה
 
@@ -21,7 +21,7 @@
 1. ממשקי StateStore מחוברים למאגר המסמכים המוצפן ול־runtime תוך שימור טרנזקציה יחידה לצריכת approval ו־dispatch ול־result/outbox. אין פירוש SQL גנרי כדי לנחש אילו ערכים להצפין.
 2. witness נפרד מחובר לפורמט המוצפן, כולל provisioning וטעינה ב־runtime, בלי לשנות receiptId, providerKey, attemptCount או binding.
 3. runtime דורש profiles ומפתחות מאומתים. תצורה חלקית, מפתח חסר או נתוני legacy נחסמים לפני dispatch; אין fallback למסד חדש או לאחסון גלוי.
-4. להוסיף מעבר offline לנתונים קיימים: לעצור writers, להעתיק ליעד מוצפן חדש, לאמת ספירות וזהויות והיכולת לפענח את כל סוגי הרשומות, ולהפעיל רק כאשר primary ו־witness תואמים. אין לייצר מזהים חדשים או לבצע פעולות ספק בעת ההעברה. המסד הישן, WAL וגיבויים נותרים עותקים רגישים עד טיפול נפרד בפריסה.
+4. מעבר offline לנתונים קיימים מומש: עוצרים writers, מעתיקים לזוג יעדים חדשים עם profiles במצב pending, מאמתים ספירות וזהויות ופענוח מלא, ומפעילים רק אחרי התאמת primary ו־witness. אין לייצר מזהים חדשים או לבצע פעולות ספק בעת ההעברה. המסד הישן, WAL וגיבויים נותרים עותקים רגישים עד טיפול נפרד בפריסה.
 5. re-encryption באצוות מומש עם CAS ומעקב אחר key IDs, בלי מחיקת tombstones ובלי הרחבת חלון replay; האימות עבר ב־CI בשני backends.
 6. מטריצת הקריסה, worker stale, audit outage, restart, concurrency ובידוד עברו עם האחסון המוצפן בשני backends. בדיקות קריאה ישירה בודקות היעדר מזהים ותוכן סינתטיים בטבלאות היעד, כולל witness.
 
@@ -49,7 +49,7 @@
 
 גם notices, תקציבי recovery, backoff, quarantine ותצפית תפעולית משתמשים במסמכים מוצפנים. רשימות שומרות על סדר המזהים וה־cursor של הממשק הישן באמצעות פענוח באצוות ובחירת התוצאות המוגבלות בזיכרון; זמן הסריקה אינו מוגבל לגודל הדף המוחזר. כך נשמרת התאימות בלי לחשוף timestamps או מזהים באינדקסים גלויים, במחיר קריאות ופענוחים נוספים.
 
-הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; מטריצת הקריסה בתהליכים נפרדים עברה כמפורט בהמשך; migration עדיין נדרש.
+הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; מטריצת הקריסה בתהליכים נפרדים עברה כמפורט בהמשך; כלי migration מומש כמפורט בהמשך.
 
 ## witness מוצפן ועצמאי
 
@@ -57,7 +57,7 @@
 
 provisioning מתאפשר רק באזור מוצפן ריק, ללא נתוני primary קיימים או טבלאות witness ישנות. הוא אינו כלי migration או איפוס. identity נבדקת בכל טרנזקציה, ואיסור שיתוף מסד עם primary נשמר גם כשה־primary הוא EncryptedStateStore.
 
-בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. ראיות קריסה בתהליכים נפרדים כשההצפנה פעילה נוספו כמפורט בהמשך; מעבר offline עדיין נדרש.
+בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. ראיות קריסה בתהליכים נפרדים כשההצפנה פעילה נוספו כמפורט בהמשך; כלי מעבר offline מומש כמפורט בהמשך.
 
 ## הפעלה דרך runtime ואתחול מרחב חדש
 
@@ -96,7 +96,7 @@ RotationBatch מחזיר cursor להמשך, scanned, changed ו־key_counts של
 
 בדיקות test_metadata_rotation.py מכסות מעבר של receipt ו־witness תוך שמירת retry יחיד ואירוע audit, עצירה וחידוש, סריקת אימות ללא כתיבה ו־rollback של אצווה בעקבות ciphertext פגום או CAS שנכשל.
 
-## חוזה מעבר offline לנתונים קיימים — למימוש
+## חוזה מעבר offline לנתונים קיימים
 
 המעבר יעתיק זוג מקורות legacy לזוג יעדים חדשים בעלי profiles ומפתחות מוגדרים מראש. המפעיל חייב לעצור ולנקז writers, כולל קריאות ספק בתהליך, לפני צילום הנתונים. נעילת מסד אינה מבטלת קריאה חיצונית שכבר יצאה. אין לבצע migration על המקור עצמו, להחליף witness identity או לפתוח keyspace ריק במקום זה שנשמר.
 
@@ -107,3 +107,23 @@ RotationBatch מחזיר cursor להמשך, scanned, changed ו־key_counts של
 בדיקות הקבלה למעבר: פעולה שהצליחה לפני ההעברה נשלפת באותו receipt בלי השפעה נוספת; unknown/pending נשארים חסומים לביצוע חדש; outbox שנמסר אינו יוצר audit נוסף; אישור שנצרך/בוטל לא חוזר להיות זמין; retention tombstones וזהות witness נשמרים; כשל באמצע ההעתקה או אימות פגום חוסם startup; ומקורות, WAL וגיבויים אינם נמחקים אוטומטית. יש להריץ אותם בשני backends עם נתונים סינתטיים.
 
 ראיית rotation: CI ב־134dd86 עבר עם 575 בדיקות וללא דילוגים. בדיקות החלפת המפתח ב־PostgreSQL פועלות במסדים ייעודיים לכל תרחיש; אין שינוי מפתח במסד הרגרסיה המשותף.
+
+## כלי מעבר offline — מימוש ואימות
+
+`metadata_migration.migrate_legacy_pair` מעתיק legacy primary ו־witness לזוג יעדים חדשים שלא עברו provisioning. כל ארבעת המסדים חייבים להיות נפרדים. ה־SDK דורש writers_stopped=True כהצהרת מפעיל שה־writers וקריאות הספק נעצרו ונוקזו; הוא אינו מסוגל להוכיח זאת עבור תהליכים חיצוניים. PostgreSQL נועל את טבלאות המקור מפני כתיבה במשך ההעתקה והאימות; SQLite מחזיק BEGIN IMMEDIATE. המקורות נשארים נתוני ייחוס ואין להחזיר אותם לכתיבה אחרי cutover.
+
+יעדי המעבר מקבלים ישירות probe מוצפן בפורמט pending שאינו מתקבל ב־MetadataRepository רגיל. אין רגע שבו יעד חלקי נפתח כ־profile ריק תקין. הכלי קורא דפי מקור של עד 100 שורות, מעתיק מסמכים ואינדקסים בזהות המקורית, ואז מבצע מעבר נוסף להשוואה מלאה מול המקור הנעול ולאימות ספירות. witness נפתח רק אחרי אימות שני היעדים, ו־primary נפתח אחריו. כשל ביניהם משאיר את primary חסום. הכלי אינו משנה נתוני מקור, מוחק קבצים, מייצר receipt/provider IDs או פונה לספק.
+
+אין resume לתוצאה חלקית ואין פעולת reset. אחרי כשל שומרים את היעדים לבדיקה ומריצים העתקה חדשה ליעדים חדשים מהמקורות שנשארו קפואים. מסד מקור עם encrypted documents, עדות witness ללא receipt תואם, היסטוריה חסרה או מפתח payload חסר נחסם. payload שפג תוקפו מפוענח לצורך אימות בלי לשנות את expiry; tombstone נשמר גם כש־payload כבר הוסר.
+
+פקודת התחזוקה היא:
+
+```text
+python -m universal_connection_service.metadata_migration --confirm-writers-stopped-and-drained
+```
+
+היא קוראת UCS_METADATA_PROFILE_ID/KEYRING_JSON ו־UCS_WITNESS_METADATA_PROFILE_ID/KEYRING_JSON ליעדים, UCS_RECEIPT_KEYRING_JSON לפענוח payload קיים ו־UCS_EXECUTION_WITNESS_ID לזהות ה־witness הקיימת. מיקומי המקור והיעד מועברים דרך ארבעה משתני סביבה: UCS_MIGRATION_SOURCE_PRIMARY_JSON, UCS_MIGRATION_SOURCE_WITNESS_JSON, UCS_MIGRATION_TARGET_PRIMARY_JSON ו־UCS_MIGRATION_TARGET_WITNESS_JSON. כל אחד מכיל אובייקט עם שדה יחיד sqlitePath או postgresUrl. אין להעביר DSN או מפתחות בארגומנטים או לשמור אותם בקובץ versioned.
+
+מקורות חייבים להיות בסכימה הנתמכת. יעדי SQLite נוצרים ביצירה בלעדית ואסור שהקבצים יתקיימו מראש. יעדי PostgreSQL הם מסדים ריקים שהוכנו מראש; פקודת ההעברה מתקינה בהם סכימה ונדרשת לה הרשאת DDL. אין להריץ את פקודת storage_runtime provisioning על יעדי migration. לאחר הצלחה מגדירים את runtime לנתיבי/DSN היעד, עם אותם profiles ומפתחות, ובודקים שליפה של receipts קיימים לפני חידוש writers. הפלט מכיל migrationId וספירות בלבד; שגיאות אינן מציגות מפתחות או DSN.
+
+בדיקות test_metadata_migration.py מכסות הצלחה ושימור control/receipt/approval/workflow/outbox/notices, pending/unknown, tombstone ו־revocation, tenant isolation ו־pagination, כשל בהעתקה/אימות/הפעלה, tampering וקריסת תהליך אמיתית, וכן את פקודת התחזוקה. אימות PostgreSQL מתבצע ב־CI במסדים ייעודיים לכל תרחיש.
