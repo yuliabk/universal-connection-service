@@ -56,6 +56,18 @@ from .sandbox_policy_compiler import (
 )
 from .sandbox_tool_policy import SandboxToolPolicyService, build_sandbox_tool_policy_router
 from .service import ConnectionService
+from .drift_scheduler import SchemaDriftScheduler
+from .mcp_server import build_mcp_server_router
+from .run_budget import InMemoryRunBudget
+from .run_budget_sqlite import SQLiteRunBudget
+from .schema_drift import MCPSchemaDriftVerifier
+from .tool_catalog import (
+    AgentToolPolicy,
+    InMemoryAgentToolPolicyStore,
+    ToolCatalog,
+    ToolExecutor,
+    build_tool_catalog_router,
+)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -287,6 +299,61 @@ service = ConnectionService(
     evidence_store=state_store,
     discovery_engine=discovery_engine,
 )
+
+
+def _build_agent_tool_policies():
+    """Agent tool allowlists, JSON array of AgentToolPolicy objects.
+
+    Absent configuration means no agent sees any tool, which is the intended
+    fail-closed default.
+    """
+    raw = os.getenv("UCS_AGENT_TOOL_POLICIES_JSON")
+    if not raw:
+        return InMemoryAgentToolPolicyStore(), "disabled"
+    payload = json.loads(raw)
+    if not isinstance(payload, list):
+        raise ValueError("UCS_AGENT_TOOL_POLICIES_JSON must be a JSON array")
+    policies = tuple(AgentToolPolicy.model_validate(item) for item in payload)
+    return InMemoryAgentToolPolicyStore(policies), "static"
+
+
+agent_tool_policy_store, agent_tool_policy_kind = _build_agent_tool_policies()
+tool_catalog = ToolCatalog(registry, agent_tool_policy_store)
+def _build_run_budget():
+    """Durable when a SQLite state path exists, in-memory otherwise.
+
+    Two workers with two in-memory counters give an agent twice its allowance,
+    so a deployment that persists state should persist the budget with it.
+    """
+    path = os.getenv("UCS_RUN_BUDGET_DB_PATH") or os.getenv("UCS_STATE_DB_PATH")
+    if path:
+        return SQLiteRunBudget(path), "sqlite"
+    return InMemoryRunBudget(), "in-memory"
+
+
+run_budget, run_budget_kind = _build_run_budget()
+schema_drift_verifier = MCPSchemaDriftVerifier(
+    registry,
+    credential_resolver=credential_resolver,
+    evidence_store=state_store,
+)
+tool_executor = ToolExecutor(tool_catalog, service, run_budget=run_budget)
+
+
+def _build_drift_scheduler():
+    raw = os.getenv("UCS_DRIFT_SWEEP_INTERVAL_SECONDS")
+    if not raw:
+        return None, "disabled"
+    interval = float(raw)
+    if interval <= 0:
+        return None, "disabled"
+    return (
+        SchemaDriftScheduler(registry, schema_drift_verifier, interval_seconds=interval),
+        f"every {interval:g}s",
+    )
+
+
+drift_scheduler, drift_scheduler_kind = _build_drift_scheduler()
 mcp_validation_service = MCPValidationService(
     registry,
     evidence_store=state_store,
@@ -410,7 +477,14 @@ async def lifespan(app: FastAPI):
         except SandboxGatewayError:
             sandbox_gateway_state = "unavailable"
     package_rehydration = _rehydrate_packages()
+    if drift_scheduler is not None:
+        drift_scheduler.start()
     yield
+    if drift_scheduler is not None:
+        await drift_scheduler.stop()
+    budget_close = getattr(run_budget, "close", None)
+    if budget_close is not None:
+        budget_close()
     close = getattr(state_store, "close", None)
     if close is not None:
         close()
@@ -422,6 +496,16 @@ app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_
 app.include_router(build_policy_auto_connect_router(policy_auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_sandbox_tool_policy_router(sandbox_policy_service, control_plane_authenticator))
 app.include_router(build_sandbox_policy_compiler_router(sandbox_policy_compiler, control_plane_authenticator))
+app.include_router(
+    build_tool_catalog_router(
+        tool_catalog,
+        service,
+        control_plane_authenticator,
+        run_budget=run_budget,
+        drift_verifier=schema_drift_verifier,
+    )
+)
+app.include_router(build_mcp_server_router(tool_catalog, tool_executor, control_plane_authenticator))
 
 
 @app.get("/health")
@@ -439,6 +523,9 @@ def health():
         "packageSandbox": mcp_sandbox_kind,
         "sandboxPolicy": sandbox_policy_kind,
         "sandboxPolicyCompiler": sandbox_policy_compiler_kind,
+        "agentToolPolicies": agent_tool_policy_kind,
+        "runBudget": run_budget_kind,
+        "driftSweep": drift_scheduler_kind,
         "sandboxPolicyWorkflow": sandbox_policy_workflow_kind,
         "sandboxGateway": sandbox_gateway_state,
         "packages": {

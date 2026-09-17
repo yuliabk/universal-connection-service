@@ -29,13 +29,24 @@ Open `http://127.0.0.1:8000/docs`.
 - `GET /v1/connectors`
 - `POST /v1/connections/plan`
 - `POST /v1/connections/execute`
+- `GET /v1/agents/{agentId}/tools` (agent tool catalog, MCP or Gemini shape)
+- `POST /v1/agents/{agentId}/tools/call` (see `docs/TOOL_CATALOG.md`)
+
+## Agent tool catalog
+
+Agents call tools through `/v1/agents/...`, either over REST or over the native
+MCP endpoint. Only `trusted` connectors are listed, and only when the agent's
+allowlist names the tool. See `docs/TOOL_CATALOG.md`.
 
 ## Security baseline
 
 - Raw credentials are never accepted by connector manifests or plans.
 - Unknown connectors fail closed.
 - Untrusted/generated implementations require validation and human approval.
-- Tenant and actor identity are explicit in every execution context.
+- Tenant and actor identity are explicit in every execution context, including
+  on the MCP endpoint, where identity comes from headers and never from the
+  JSON-RPC payload.
+- Agent tool access is default-deny: no allowlist means no tools.
 - Production secret storage, OAuth callbacks and persistent audit storage are intentionally deferred.
 
 ## Next milestone
