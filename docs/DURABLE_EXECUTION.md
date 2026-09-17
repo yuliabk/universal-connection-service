@@ -30,9 +30,9 @@ ConnectionService יבדוק receipt לפני צריכת אישור שכבר ש�
 ה־Owner ביקש להשלים את פרויקט UCS בהמשך להצגת טיוטת UCS-19. המימוש מתקדם בענף נפרד, קבוצה אחת בכל פעם עם בדיקה לפני המשך.
 
 - [x] G1: חוזים, receipt store, CAS ו־outbox טרנזקציוני בשני backends (001–003, 006–008); הראיות להלן מכסות את שכבת האחסון בלבד.
-- [x] G2: ConnectionService, אישורים קשורים ובדיקות הרשאה לפני IO (001–005); היקף וראיות להלן. reconciliation ומוכנות Production עדיין פתוחים.
-- [ ] G3: recovery, auto-connect, audit delivery וגבולות retention/retry (004–007).
-- [ ] G4: fault injection בין תהליכים, רגרסיה, ראיות ומגבלות מסירה (008).
+- [x] G2: ConnectionService, אישורים קשורים ובדיקות הרשאה לפני IO (001–005); היקף וראיות להלן. reconciliation מומש בהמשך; מוכנות Production אינה כלולה באישור זה.
+- [x] G3: recovery, auto-connect, audit delivery וגבולות retention/retry (004–007).
+- [ ] G4: fault injection בין תהליכים והרגרסיה עברו; הרחבת הקבלה הסופית וסקירת Owner פתוחות (008).
 
 העלויות הן כתיבות database וקריאות reconciliation מוגבלות. מוכנות Production אינה נובעת ממעבר בדיקות יחידה; היא דורשת גם contract של ספק, פריסה, הצפנה ו־restore מוכחים. בשלב הבנייה משתמשים בנתונים וספקים סינתטיים בלבד.
 
@@ -241,3 +241,9 @@ README, SPEC, תיעוד מיגרציות ו־UCS19_RUNBOOK.md עודכנו לפ
 הרצת CI חשפה שרשומה עם bindingSchemaVersion עתידי עוצרת את סריקת התוצאות של כל הארגונים. receipt_result_page מחזיר כעת דף גולמי עם cursor מה־index; ה־worker מאמת כל מסמך בנפרד לפני בחינת expiry. מסמך לא נתמך או פגום נשאר ללא שינוי ואינו חוסם דפים מאוחרים. לא הוקלה חסימת הביצוע של גרסה לא מוכרת ולא נמחקת זהות פעולה.
 
 ב־f02875a עברו [374 בדיקות ב־CI](https://github.com/yuliabk/universal-connection-service/actions/runs/35140519971), ללא דילוגים, כולל PostgreSQL 16 ו־Docker. בניית wheel וטעינת app ממנו עברו באותו job. הרגרסיה המקומית עברה עם 257 בדיקות ו־117 דילוגים. מטריצת הקבלה העדכנית מחליפה את סטטוסי הביניים לעיל; הצפנת metadata במנוחה וקבלת Owner עדיין פתוחות.
+
+## מצב מסירה נוכחי — 2026-09-17
+
+EncryptedStateStore ו־EncryptedDispatchWitness מחוברים ל־runtime, כולל provisioning מפורש, rotation באצוות ומעבר offline מאומת. CI של 128227b עבר עם 605 בדיקות ללא דילוגים. זו ראיית SQLite/PostgreSQL, Docker ואריזת wheel, כולל קריסת תהליך במהלך migration ושימור receipt/provider/approval identity.
+
+מפת דרישות וגבולות הקבלה העדכנית נמצאת ב־UCS19_ACCEPTANCE.md. פרקי הראיות הקודמים הם היסטוריית העבודה; סטטוס ישן כגון “העבודה הבאה” אינו מבטל מימוש שתועד אחריו. סקירת Owner וקבלה סופית אינן מוסקות ממעבר CI, ופריסת Production דורשת היקף נפרד.

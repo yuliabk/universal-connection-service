@@ -115,8 +115,8 @@ def candidate(candidate_id="candidate-1", endpoint="https://records.example/mcp"
     )
 
 
-def stack(*, trusted=None, candidates=(), path=":memory:"):
-    store = SQLiteStateStore(path)
+def stack(*, trusted=None, candidates=(), path=":memory:", store_factory=None):
+    store = (store_factory or SQLiteStateStore)(path)
     registry = ConnectorRegistry(state_store=store)
     if trusted is not None:
         registry.register(Registration(connector=trusted, status="trusted", organization_id="org-1"))
@@ -383,7 +383,7 @@ def test_metadata_reviewer_cannot_execute_or_resume_as_an_ungranted_actor():
 
 
 @pytest.mark.parametrize("uncertain", [False, True])
-def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_path, monkeypatch, uncertain):
+def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_path, monkeypatch, uncertain, store_factory=None):
     class Connector(StubConnector):
         async def execute(self, capability, input, ctx):
             self.calls += 1
@@ -392,7 +392,7 @@ def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_pa
             return ConnectorResult(status="success", data={"ok": True})
     connector = Connector(capabilities=("records.write",))
     path = tmp_path / "resume.sqlite3"
-    store, _, service, _, orchestrator = stack(trusted=connector, path=path)
+    store, _, service, _, orchestrator = stack(trusted=connector, path=path, store_factory=store_factory)
     req = request(operation="update", capability="records.write")
     req.operation_id = "resume-operation"
     target = ExecutionTarget(organizationId="org-1", serviceId="records", capability="records.write",
@@ -415,7 +415,7 @@ def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_pa
     assert connector.calls == 1
     original = store.get_receipt("org-1", req.operation_id)
     store.close()
-    reopened, _, service2, _, orchestrator2 = stack(trusted=connector, path=path)
+    reopened, _, service2, _, orchestrator2 = stack(trusted=connector, path=path, store_factory=store_factory)
     service2.durable_executor = DurableExecutor(reopened, cipher, (target,), witness=witness_for(reopened))
     resumed = asyncio.run(orchestrator2.advance(actor, started.workflow.workflow_id,
         AutoConnectAdvanceCommand(request=req)))
