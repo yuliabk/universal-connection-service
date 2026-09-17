@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
+from .capability_schemas import CapabilitySchema
 from .contracts import (
     AuthRequirement,
     ConnectionError,
@@ -31,6 +32,9 @@ except ImportError:  # pragma: no cover - exercised only when optional extra is 
 class MCPToolBinding(Model):
     capability: str = Field(min_length=1)
     tool: str = Field(min_length=1)
+    # The tool's own inputSchema as reported by tools/list. Optional so that
+    # bindings created before the tool catalog still load.
+    capability_schema: CapabilitySchema | None = Field(alias="capabilitySchema", default=None)
 
 
 class MCPHTTPConfig(Model):
@@ -83,6 +87,11 @@ class MCPConnectorAdapter:
         self._client_factory = client_factory
         self._credential_resolver = credential_resolver
         self._bindings = {binding.capability: binding.tool for binding in config.bindings}
+        self._schemas = {
+            binding.capability: binding.capability_schema
+            for binding in config.bindings
+            if binding.capability_schema is not None
+        }
 
     def manifest(self) -> ConnectorManifest:
         return ConnectorManifest(
@@ -93,6 +102,24 @@ class MCPConnectorAdapter:
             strategy="mcp",
             capabilities=tuple(self._bindings),
             auth=self.config.auth,
+        )
+
+    def capability_schemas(self) -> tuple[CapabilitySchema, ...]:
+        """Argument contracts per capability.
+
+        Unlike the OpenAPI adapter there is no path/query/body envelope here:
+        `execute` forwards the input straight to `call_tool`, so the published
+        schema is the MCP tool's own inputSchema. A binding without one falls
+        back to an untyped object rather than claiming a contract it lacks.
+        """
+        return tuple(
+            self._schemas.get(capability)
+            or CapabilitySchema(
+                capability=capability,
+                description=f"{self.config.name}: {tool}",
+                inputSchema={"type": "object"},
+            )
+            for capability, tool in self._bindings.items()
         )
 
     @asynccontextmanager
