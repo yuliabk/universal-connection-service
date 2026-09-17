@@ -29,6 +29,8 @@ from universal_connection_service.postgres_store import (
 )
 from universal_connection_service.registry import ConnectorRegistry, Registration
 from universal_connection_service.service import ConnectionService
+from universal_connection_service.execution import DurableExecutor, ExecutionTarget, ResultCipher
+from universal_connection_service.receipts import execution_binding
 
 
 DSN = os.getenv("UCS_TEST_POSTGRES_URL")
@@ -200,8 +202,10 @@ def test_persistent_approval_store_hashes_raw_id_and_consumes_atomically():
     store2.close()
 
 
-def test_persistent_approval_verifier_allows_exactly_one_service_execution():
+def test_persistent_approval_verifier_allows_exactly_one_service_execution(tmp_path):
+    from witness_helpers import witness_for
     store = PostgresStateStore(config(auto_migrate=True))
+    store.test_witness_path = tmp_path / "independent-witness.sqlite3"
     suffix = uuid4().hex
     raw_id = f"approval-{suffix}"
     organization_id = f"org-{suffix}"
@@ -216,23 +220,34 @@ def test_persistent_approval_verifier_allows_exactly_one_service_execution():
         )
     )
     verifier = PersistentApprovalVerifier(store)
-    verifier.register(grant(raw_id, request_id=request_id, organization_id=organization_id))
+    req = request(request_id=request_id, organization_id=organization_id)
+    req.operation_id = "operation-" + suffix
+    bound_grant = grant(raw_id, request_id=request_id, organization_id=organization_id)
+    bound_grant.operation_id = req.operation_id
+    bound_grant.binding_digest = execution_binding(req, "account-1")
+    verifier.register(bound_grant)
+    target = ExecutionTarget(organizationId=organization_id, serviceId="records", capability="records.write",
+        providerAccountId="account-1", connectorId=connector.connector_id, connectorVersion="1.0.0",
+        operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
+        successIsFinal=True, resultRetentionSeconds=3600)
     service = ConnectionService(
         registry,
         approval_verifier=verifier,
         audit_store=store,
         evidence_store=store,
+        durable_executor=DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,), witness=witness_for(store)),
     )
-    req = request(request_id=request_id, organization_id=organization_id)
     ctx = context(request_id=request_id, organization_id=organization_id, approval_id=raw_id)
 
     first = asyncio.run(service.execute(req, ctx))
     second = asyncio.run(service.execute(req, ctx))
 
     assert first.status == "success"
-    assert second.status == "failed"
-    assert second.error.code == "APPROVAL_ALREADY_USED"
+    assert second.status == "success"
+    assert second.receipt_id == first.receipt_id
+    assert second.audit_id == first.audit_id
     assert connector.calls == 1
+    assert len(store.pending_receipt_audit(organization_id)) == 1
 
     audits = store.list_audit(organization_id, request_id=request_id)
     evidence = store.list_evidence(organization_id, request_id=request_id)

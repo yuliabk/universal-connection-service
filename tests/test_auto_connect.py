@@ -1,4 +1,7 @@
+from effect_helpers import approve_read
 import asyncio
+import pytest
+from witness_helpers import witness_for
 from datetime import datetime, timedelta, timezone
 
 from mcp import Client
@@ -27,6 +30,7 @@ from universal_connection_service.mcp_validation import MCPValidationService
 from universal_connection_service.persistence import ConnectionWorkflowRecord, SQLiteStateStore
 from universal_connection_service.registry import ConnectorRegistry, Registration
 from universal_connection_service.service import ConnectionService
+from universal_connection_service.execution import DurableExecutor, ExecutionTarget, ResultCipher
 
 
 class StubConnector:
@@ -73,12 +77,13 @@ def records_read() -> dict:
     return {"ok": True}
 
 
-def principal(*scopes):
+def principal(*scopes, execution=True):
     return ControlPlanePrincipal(
         subject="owner",
         tokenId="owner-token",
         organizations=("org-1",),
-        scopes=scopes,
+        scopes=scopes + (("connections:execute",) if execution else ()),
+        executionActors=(ActorRef(userId="u1", organizationId="org-1", agentId="a1"),) if execution else (),
     )
 
 
@@ -110,8 +115,8 @@ def candidate(candidate_id="candidate-1", endpoint="https://records.example/mcp"
     )
 
 
-def stack(*, trusted=None, candidates=()):
-    store = SQLiteStateStore(":memory:")
+def stack(*, trusted=None, candidates=(), path=":memory:", store_factory=None):
+    store = (store_factory or SQLiteStateStore)(path)
     registry = ConnectorRegistry(state_store=store)
     if trusted is not None:
         registry.register(Registration(connector=trusted, status="trusted", organization_id="org-1"))
@@ -124,6 +129,8 @@ def stack(*, trusted=None, candidates=()):
         evidence_store=store,
         discovery_engine=discovery,
     )
+    if trusted is not None and "records.read" in trusted.manifest().capabilities:
+        approve_read(service, request())
     validator = MCPValidationService(
         registry,
         evidence_store=store,
@@ -241,6 +248,7 @@ def test_mcp_candidate_runs_discovery_validation_promotion_and_execution_end_to_
     )
     assert workflow.stage == "awaiting_promotion"
     raw = approval.approval_id
+    approve_read(orchestrator.connection_service, req, connector_id)
 
     completed = asyncio.run(
         orchestrator.promote_and_advance(
@@ -260,11 +268,17 @@ def test_mcp_candidate_runs_discovery_validation_promotion_and_execution_end_to_
     store.close()
 
 
-def test_trusted_write_pauses_for_execution_approval_and_consumes_once():
+def test_trusted_write_pauses_for_execution_approval_and_consumes_once(tmp_path):
     connector = StubConnector(capabilities=("records.write",))
-    store, _, _, _, orchestrator = stack(trusted=connector)
+    store, _, service, _, orchestrator = stack(trusted=connector, path=tmp_path / "write.sqlite3")
     actor = principal("connectors:review", "approvals:issue")
     req = request(operation="update", capability="records.write")
+    req.operation_id = "write-operation-1"
+    target = ExecutionTarget(organizationId="org-1", serviceId="records", capability="records.write",
+        providerAccountId="account-1", connectorId="trusted-records", connectorVersion="1.0.0",
+        operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
+        successIsFinal=True, resultRetentionSeconds=3600)
+    service.durable_executor = DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,), witness=witness_for(store))
 
     started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
     assert started.workflow.stage == "awaiting_execution_approval"
@@ -299,6 +313,34 @@ def test_trusted_write_pauses_for_execution_approval_and_consumes_once():
     store.close()
 
 
+def test_unknown_execution_does_not_offer_workflow_restart(tmp_path):
+    class UncertainConnector(StubConnector):
+        async def execute(self, capability, input, ctx):
+            self.calls += 1
+            raise TimeoutError("provider outcome unknown")
+    connector = UncertainConnector(capabilities=("records.write",))
+    store, _, service, _, orchestrator = stack(trusted=connector, path=tmp_path / "uncertain.sqlite3")
+    req = request(operation="update", capability="records.write")
+    req.operation_id = "uncertain-1"
+    target = ExecutionTarget(organizationId="org-1", serviceId="records", capability="records.write",
+        providerAccountId="account-1", connectorId="trusted-records", connectorVersion="1.0.0",
+        operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
+        successIsFinal=True, resultRetentionSeconds=3600)
+    service.durable_executor = DurableExecutor(store, ResultCipher({"test": b"x" * 32}, "test"), (target,), witness=witness_for(store))
+    actor = principal("connectors:review", "approvals:issue")
+    started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
+    issued = orchestrator.issue_execution_approval(actor, started.workflow.workflow_id,
+        AutoConnectExecutionApprovalCommand(request=req, expiresInSeconds=300))
+    command = AutoConnectAdvanceCommand(request=req, executionApprovalId=issued.approval_id)
+    uncertain = asyncio.run(orchestrator.advance(actor, started.workflow.workflow_id, command))
+    assert uncertain.workflow.stage == "awaiting_reconciliation"
+    assert uncertain.workflow.next_action == "reconcile_execution"
+    assert uncertain.result.error.code == "OUTCOME_UNKNOWN"
+    assert asyncio.run(orchestrator.advance(actor, started.workflow.workflow_id, command)).workflow.stage == "awaiting_reconciliation"
+    assert connector.calls == 1
+    store.close()
+
+
 def test_workflow_lease_is_atomic_and_can_be_reclaimed_after_expiry():
     store = SQLiteStateStore(":memory:")
     now = datetime.now(timezone.utc)
@@ -318,3 +360,73 @@ def test_workflow_lease_is_atomic_and_can_be_reclaimed_after_expiry():
     later = now + timedelta(seconds=11)
     assert store.claim_workflow("org-1", record.workflow_id, "lease-c", later + timedelta(seconds=10), later) is True
     store.close()
+
+
+def test_metadata_reviewer_cannot_execute_or_resume_as_an_ungranted_actor():
+    connector = StubConnector()
+    store, _, _, _, orchestrator = stack(trusted=connector)
+    reviewer = principal("connectors:review", execution=False)
+    req = request()
+    preview = asyncio.run(orchestrator.start(reviewer,
+        AutoConnectStartCommand(request=req, executeWhenReady=False)))
+    assert preview.workflow.stage == "ready_to_execute"
+    with pytest.raises(AutoConnectError) as error:
+        asyncio.run(orchestrator.advance(reviewer, preview.workflow.workflow_id,
+            AutoConnectAdvanceCommand(request=req)))
+    assert error.value.code == "EXECUTION_ACTOR_FORBIDDEN"
+    assert connector.calls == 0
+    completed = asyncio.run(orchestrator.advance(principal("connectors:review"), preview.workflow.workflow_id,
+        AutoConnectAdvanceCommand(request=req)))
+    assert completed.result.status == "success"
+    assert connector.calls == 1
+    store.close()
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_receipt_resumes_after_workflow_save_failure_without_new_approval(tmp_path, monkeypatch, uncertain, store_factory=None):
+    class Connector(StubConnector):
+        async def execute(self, capability, input, ctx):
+            self.calls += 1
+            if uncertain:
+                raise TimeoutError("synthetic uncertain provider outcome")
+            return ConnectorResult(status="success", data={"ok": True})
+    connector = Connector(capabilities=("records.write",))
+    path = tmp_path / "resume.sqlite3"
+    store, _, service, _, orchestrator = stack(trusted=connector, path=path, store_factory=store_factory)
+    req = request(operation="update", capability="records.write")
+    req.operation_id = "resume-operation"
+    target = ExecutionTarget(organizationId="org-1", serviceId="records", capability="records.write",
+        providerAccountId="account-1", connectorId="trusted-records", connectorVersion="1.0.0",
+        operations=("update",), userIds=("u1",), agentIds=("a1",), allowNoCredentials=True,
+        successIsFinal=True, resultRetentionSeconds=3600)
+    cipher = ResultCipher({"test": b"x" * 32}, "test")
+    service.durable_executor = DurableExecutor(store, cipher, (target,), witness=witness_for(store))
+    actor = principal("connectors:review", "approvals:issue")
+    started = asyncio.run(orchestrator.start(actor, AutoConnectStartCommand(request=req)))
+    issued = orchestrator.issue_execution_approval(actor, started.workflow.workflow_id,
+        AutoConnectExecutionApprovalCommand(request=req, expiresInSeconds=300))
+    def fail_save(*args, **kwargs):
+        raise RuntimeError("synthetic workflow commit failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "_save", fail_save)
+        with pytest.raises(RuntimeError):
+            asyncio.run(orchestrator.advance(actor, started.workflow.workflow_id,
+                AutoConnectAdvanceCommand(request=req, executionApprovalId=issued.approval_id)))
+    assert connector.calls == 1
+    original = store.get_receipt("org-1", req.operation_id)
+    store.close()
+    reopened, _, service2, _, orchestrator2 = stack(trusted=connector, path=path, store_factory=store_factory)
+    service2.durable_executor = DurableExecutor(reopened, cipher, (target,), witness=witness_for(reopened))
+    resumed = asyncio.run(orchestrator2.advance(actor, started.workflow.workflow_id,
+        AutoConnectAdvanceCommand(request=req)))
+    assert resumed.workflow.stage == ("awaiting_reconciliation" if uncertain else "completed")
+    assert resumed.result.receipt_id == original.receipt_id
+    if uncertain:
+        assert resumed.result.error.code == "OUTCOME_UNKNOWN"
+        paused = asyncio.run(orchestrator2.advance(actor, started.workflow.workflow_id,
+            AutoConnectAdvanceCommand(request=req, executeWhenReady=False)))
+        assert paused.workflow.stage == "awaiting_reconciliation"
+    else:
+        assert resumed.result.status == "success"
+    assert connector.calls == 1
+    reopened.close()

@@ -187,3 +187,7 @@ UCS-06 is ready when CI proves that:
 - encryption-at-rest configuration owned by the deployment database;
 - transactional outbox / event export;
 - OpenTelemetry correlation and external SIEM export.
+
+## UCS-19 runtime update
+
+Persistent runtime storage now requires pre-provisioned encrypted metadata profiles and keyrings. Setting UCS_STATE_DB_PATH alone is no longer sufficient. Missing keys or legacy rows block startup rather than falling back to plaintext. The native SQLiteStateStore remains available to trusted SDK/migration code; it is not the app runtime's persistent store. See UCS19_METADATA_ENCRYPTION.md for provisioning and current migration limitations.

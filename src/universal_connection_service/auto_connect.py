@@ -38,6 +38,8 @@ NextAction = Literal[
     "issue_execution_approval",
     "provide_execution_approval",
     "retry_validation",
+    "reconcile_execution",
+    "review_capability_effect",
     "restart",
     "none",
 ]
@@ -130,6 +132,8 @@ class AutoConnectOrchestrator:
     @staticmethod
     def _fingerprint(request: ConnectionRequest) -> str:
         payload = request.model_dump(by_alias=True, mode="json")
+        if request.operation_id is None:
+            payload.pop("operationId", None)  # preserve UCS-18 read workflow fingerprints
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
@@ -160,6 +164,8 @@ class AutoConnectOrchestrator:
             "awaiting_promotion": "provide_promotion_approval",
             "awaiting_execution_approval": "issue_execution_approval",
             "ready_to_execute": "advance",
+            "awaiting_reconciliation": "reconcile_execution",
+            "awaiting_effect_classification": "review_capability_effect",
             "completed": "none",
             "failed": "restart",
         }[record.stage]
@@ -268,6 +274,10 @@ class AutoConnectOrchestrator:
         self._assert_request(record, request)
         if record.stage in {"completed", "failed"}:
             return AutoConnectResponse(workflow=self._view(record))
+        if record.stage == "awaiting_reconciliation" and (
+            not command.execute_when_ready or self.connection_service.durable_executor is None
+        ):
+            return AutoConnectResponse(workflow=self._view(record))
 
         lease = self._claim(record)
         revision = record.revision
@@ -301,7 +311,11 @@ class AutoConnectOrchestrator:
         if trusted is not None:
             record.connector_id = trusted.manifest.connector_id
             record.connector_version = trusted.manifest.version
-            return await self._drive_execution(record, command, plan)
+            return await self._drive_execution(principal, record, command, plan)
+
+        if record.stage == "awaiting_reconciliation":
+            record.last_code = "CONNECTION_UNAVAILABLE"
+            return AutoConnectResponse(workflow=self._view(record), plan=plan)
 
         candidate = self._select_candidate(record, command, plan)
         if candidate is None:
@@ -371,17 +385,40 @@ class AutoConnectOrchestrator:
 
     async def _drive_execution(
         self,
+        principal: ControlPlanePrincipal,
         record: ConnectionWorkflowRecord,
         command: AutoConnectAdvanceCommand,
         plan: ConnectionPlan,
     ) -> AutoConnectResponse:
         request = command.request
+        if command.execute_when_ready and not principal.allows_execution(request.actor):
+            raise AutoConnectError("EXECUTION_ACTOR_FORBIDDEN", "Principal cannot execute as this actor", status_code=403)
+        registration = self.registry.trusted(plan.service_id, request.capability, request.actor.organization_id)
+        if (registration is not None
+            and not self.connection_service.requires_durable_execution(request, plan, registration)
+            and self.connection_service.effect_catalog.classify(request, registration) != "read_only"):
+            record.stage = "awaiting_effect_classification"
+            record.last_code = "EFFECT_CLASSIFICATION_REQUIRED"
+            return AutoConnectResponse(workflow=self._view(record), plan=plan)
         if plan.auth_requirement.type != "none" and command.credential_handle is None:
             record.stage = "awaiting_credentials"
             record.last_code = "CREDENTIAL_HANDLE_REQUIRED"
             return AutoConnectResponse(workflow=self._view(record), plan=plan)
 
         approval = command.execution_approval_id.get_secret_value() if command.execution_approval_id else None
+        context = ExecutionContext(requestId=request.request_id, userId=request.actor.user_id,
+            organizationId=request.actor.organization_id, credentialHandle=command.credential_handle,
+            approvalId=approval, deadlineMs=command.deadline_ms)
+        if (command.execute_when_ready and request.operation_id
+            and self.connection_service.durable_executor is not None):
+            # A prior dispatch may have committed before the workflow save failed.
+            # This path cannot create/consume an approval or perform connector IO.
+            existing = await self.connection_service.execute(request, context, allow_dispatch=False)
+            if record.stage == "awaiting_reconciliation" and not existing.receipt_id:
+                record.last_code = existing.error.code if existing.error else "RECEIPT_NOT_FOUND"
+                return AutoConnectResponse(workflow=self._view(record), plan=plan, result=existing)
+            if existing.error is None or existing.error.code != "RECEIPT_NOT_DISPATCHED":
+                return self._execution_response(record, plan, existing)
         if plan.policy_decision == "REQUIRE_APPROVAL" and approval is None:
             record.stage = "awaiting_execution_approval"
             record.last_code = "EXECUTION_APPROVAL_REQUIRED"
@@ -394,21 +431,23 @@ class AutoConnectOrchestrator:
 
         result = await self.connection_service.execute(
             request,
-            ExecutionContext(
-                requestId=request.request_id,
-                userId=request.actor.user_id,
-                organizationId=request.actor.organization_id,
-                credentialHandle=command.credential_handle,
-                approvalId=approval,
-                deadlineMs=command.deadline_ms,
-            ),
+            context,
         )
+        return self._execution_response(record, plan, result)
+
+    def _execution_response(self, record, plan, result):
         record.result_audit_id = result.audit_id
         if result.status in {"success", "partial"}:
             record.stage = "completed"
             record.last_code = "CONNECTION_COMPLETED"
+        elif result.receipt_id and result.execution_state not in {None, "prepared"}:
+            record.stage = "awaiting_reconciliation"
+            record.last_code = result.error.code if result.error else "OUTCOME_UNKNOWN"
         elif result.error is not None and result.error.code.startswith("CREDENTIAL_"):
             record.stage = "awaiting_credentials"
+            record.last_code = result.error.code
+        elif result.error is not None and result.error.code == "EFFECT_CLASSIFICATION_REQUIRED":
+            record.stage = "awaiting_effect_classification"
             record.last_code = result.error.code
         elif result.error is not None and result.error.code.startswith("APPROVAL_"):
             record.stage = "awaiting_execution_approval"
@@ -512,6 +551,21 @@ class AutoConnectOrchestrator:
         if record.stage != "awaiting_execution_approval":
             raise AutoConnectError("WORKFLOW_NOT_AWAITING_EXECUTION_APPROVAL", "Workflow is not awaiting execution approval")
 
+        binding = None
+        executor = self.connection_service.durable_executor
+        plan = self.connection_service.compiler.compile(request)
+        registration = self.registry.trusted(plan.service_id, request.capability, organization_id)
+        if registration is None:
+            raise AutoConnectError("CONNECTION_UNAVAILABLE", "Connector is no longer available")
+        side_effecting = self.connection_service.requires_durable_execution(request, plan, registration)
+        if side_effecting and executor is not None:
+            from .receipts import ReceiptError
+            try:
+                binding = executor.approval_binding(request)
+            except ReceiptError as exc:
+                raise AutoConnectError(exc.code, "Cannot bind this execution approval") from None
+        elif side_effecting:
+            raise AutoConnectError("DURABLE_EXECUTION_REQUIRED", "Durable execution is not configured", status_code=503)
         raw = secrets.token_urlsafe(32)
         ref = approval_ref_hash(raw)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=command.expires_in_seconds)
@@ -526,6 +580,8 @@ class AutoConnectOrchestrator:
                 capability=request.capability,
                 operation=request.operation,
                 expiresAt=expires_at,
+                operationId=request.operation_id if binding else None,
+                bindingDigest=binding,
             )
         )
         if self.evidence_store is not None:

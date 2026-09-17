@@ -84,7 +84,12 @@ ucs_internal.schema_migration
 The current migrations are:
 
 1. connector state, validation/policy evidence, execution audit;
-2. persistent approval grants.
+2. persistent approval grants;
+3. persistent auto-connect workflows;
+4. durable execution receipts, attempts and audit outbox;
+5. operation-bound approvals and encrypted execution results;
+6. tenant-scoped execution operational notices;
+7. encrypted metadata storage primitives (profile, tenant directory, documents); runtime integration is still pending.
 
 Migrations run under a transaction-scoped PostgreSQL advisory lock so two deploy processes cannot apply the same UCS migration concurrently.
 
@@ -149,13 +154,13 @@ No public approval-issuance endpoint is added in UCS-07. Approval creation is an
 
 ## Runtime selection
 
-Application startup chooses persistence in this order:
+Application startup requires exactly one configured persistent backend and a provisioned encrypted profile/keyring; both backend settings together are rejected:
 
 1. `UCS_DATABASE_URL` -> PostgreSQL/Supabase;
 2. `UCS_STATE_DB_PATH` -> SQLite reference backend;
 3. neither -> in-memory behavior.
 
-`GET /health` reports `postgres`, `sqlite`, or `memory` in the `state` field.
+`GET /health` reports `postgres`, `sqlite`, or `memory` in the `state` field. PostgreSQL and SQLite runtime stores are now wrapped by EncryptedStateStore. See UCS19_METADATA_ENCRYPTION.md for required metadata keys, profile provisioning and migration limitations; schema migration alone does not provision an encrypted keyspace.
 
 ## Security properties
 

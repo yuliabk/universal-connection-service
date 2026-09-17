@@ -5,6 +5,7 @@ from .discovery import DiscoveryEngine, DiscoveryQuery
 from .persistence import EvidenceRecord, EvidenceStore
 from .policy import DefaultPolicyEngine, PolicyEngine, PolicyFacts
 from .registry import ConnectorRegistry
+from .effects import EffectCatalog
 
 
 class ConnectionCompiler:
@@ -14,11 +15,13 @@ class ConnectionCompiler:
         policy_engine: PolicyEngine | None = None,
         evidence_store: EvidenceStore | None = None,
         discovery_engine: DiscoveryEngine | None = None,
+        effect_catalog: EffectCatalog | None = None,
     ):
         self.registry = registry
         self.policy_engine = policy_engine or DefaultPolicyEngine()
         self.evidence_store = evidence_store
         self.discovery_engine = discovery_engine
+        self.effect_catalog = effect_catalog if effect_catalog is not None else EffectCatalog()
 
     @staticmethod
     def service_id(req: ConnectionRequest) -> str:
@@ -114,7 +117,10 @@ class ConnectionCompiler:
             raise ValueError("policy evidence phase must be plan or execution")
         service_id = self.service_id(req)
         found = self.registry.trusted(service_id, req.capability, req.actor.organization_id)
-        evaluation = self.policy_engine.evaluate(self._policy_facts(req, trusted_connector=found is not None))
+        facts = self._policy_facts(req, trusted_connector=found is not None)
+        if found is not None and self.effect_catalog.classify(req, found) == "side_effecting":
+            facts.read_only = False
+        evaluation = self.policy_engine.evaluate(facts)
         self._persist_policy_evidence(
             req,
             phase=phase,

@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
@@ -181,6 +182,7 @@ def test_policy_evidence_and_execution_audit_are_persisted_without_request_secre
         evidence_store=store,
     )
     req = request(input={"secret": "raw-request-secret"})
+    approve_read(service, req)
 
     plan = service.compiler.compile(req)
     assert plan.policy_decision == "ALLOW"
@@ -248,7 +250,8 @@ def test_approval_evidence_and_audit_store_only_hashed_reference():
             context(request_id="r-write", approval_id=raw_approval_id),
         )
     )
-    assert result.status == "success"
+    assert result.status == "failed"
+    assert result.error.code == "DURABLE_EXECUTION_REQUIRED"
 
     approval_evidence = store.list_evidence(
         "org-1",
@@ -256,7 +259,7 @@ def test_approval_evidence_and_audit_store_only_hashed_reference():
         kind="approval_verification",
     )
     assert len(approval_evidence) == 1
-    assert approval_evidence[0].payload["valid"] is True
+    assert approval_evidence[0].payload["valid"] is False
     assert approval_evidence[0].payload["approvalRefHash"]
 
     audit = store.list_audit("org-1", request_id="r-write")
@@ -279,6 +282,8 @@ def test_audit_and_evidence_queries_are_tenant_scoped():
     registry.register(Registration(connector=StubConnector(), status="trusted"))
     service = ConnectionService(registry, audit_store=store, evidence_store=store)
 
+    approve_read(service, request(organization_id="org-1"))
+    approve_read(service, request(organization_id="org-2"))
     first = asyncio.run(service.execute(request(organization_id="org-1", request_id="o1"), context(organization_id="org-1", request_id="o1")))
     second = asyncio.run(service.execute(request(organization_id="org-2", request_id="o2"), context(organization_id="org-2", request_id="o2")))
     assert first.status == second.status == "success"

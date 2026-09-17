@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 
 from mcp import Client
@@ -110,6 +111,7 @@ def test_trusted_mcp_connector_executes_through_connection_service():
         input={"value": "through-core"},
     )
 
+    approve_read(service, request)
     result = asyncio.run(service.execute(request, context()))
     assert result.status == "success"
     assert result.connector_id == "synthetic-mcp"

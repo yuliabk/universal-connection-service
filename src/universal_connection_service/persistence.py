@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
+from .receipt_store import SQLReceiptStore, receipt_schema, receipt_result_schema
+from .execution_observability import execution_notice_schema
+from .receipts import ReceiptStore
+from .metadata_storage import metadata_schema
 
 from .contracts import (
     ConnectorManifest,
@@ -31,6 +36,8 @@ WorkflowStage = Literal[
     "awaiting_promotion",
     "awaiting_execution_approval",
     "ready_to_execute",
+    "awaiting_reconciliation",
+    "awaiting_effect_classification",
     "completed",
     "failed",
 ]
@@ -169,23 +176,48 @@ class WorkflowStore(Protocol):
 
 
 @runtime_checkable
-class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, WorkflowStore, Protocol):
+class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, WorkflowStore, ReceiptStore, Protocol):
     pass
 
 
-class SQLiteStateStore:
+class SQLiteStateStore(SQLReceiptStore):
     """SQLite reference store for UCS control-plane state."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, must_exist: bool = False) -> None:
         self.path = str(path)
         self._lock = RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        source = Path(self.path).resolve().as_uri() + "?mode=rw" if must_exist else self.path
+        self._connection = sqlite3.connect(source, check_same_thread=False, uri=must_exist)
         self._connection.row_factory = sqlite3.Row
         with self._lock:
             self._connection.execute("PRAGMA foreign_keys = ON")
             if self.path != ":memory:":
                 self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA synchronous = FULL")
             self._create_schema()
+            with self._connection:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for statement in receipt_schema():
+                    self._connection.execute(statement)
+                self._connection.execute(receipt_result_schema())
+                self._connection.execute(execution_notice_schema())
+                for statement in metadata_schema():
+                    self._connection.execute(statement)
+                columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(approval_grant)")}
+                for column in ("operation_id", "binding_digest", "revoked_at"):
+                    if column not in columns:
+                        self._connection.execute(f"ALTER TABLE approval_grant ADD COLUMN {column} TEXT")
+
+    @property
+    def receipts_durable(self) -> bool:
+        return self.path not in {":memory:", ""}
+
+    @contextmanager
+    def _receipt_transaction(self):
+        # BEGIN IMMEDIATE serializes read/CAS/attempt transactions across processes.
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            yield self._connection
 
     def close(self) -> None:
         with self._lock:
@@ -521,8 +553,8 @@ class SQLiteStateStore:
                 INSERT INTO approval_grant (
                     approval_ref_hash, request_id, organization_id, user_id,
                     agent_id, service_id, capability, operation, expires_at,
-                    consumed_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    consumed_at, created_at, operation_id, binding_digest, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (approval_ref_hash) DO NOTHING
                 """,
                 (
@@ -537,6 +569,9 @@ class SQLiteStateStore:
                     record.expires_at.isoformat(),
                     record.consumed_at.isoformat() if record.consumed_at else None,
                     record.created_at.isoformat(),
+                    record.operation_id,
+                    record.binding_digest,
+                    record.revoked_at.isoformat() if record.revoked_at else None,
                 ),
             )
 
@@ -562,6 +597,9 @@ class SQLiteStateStore:
             expiresAt=datetime.fromisoformat(row["expires_at"]),
             consumedAt=datetime.fromisoformat(row["consumed_at"]) if row["consumed_at"] else None,
             createdAt=datetime.fromisoformat(row["created_at"]),
+            operationId=row["operation_id"],
+            bindingDigest=row["binding_digest"],
+            revokedAt=row["revoked_at"],
         )
 
     def consume_approval(self, approval_ref_hash: str, consumed_at: datetime) -> bool:
@@ -573,6 +611,7 @@ class SQLiteStateStore:
                 SET consumed_at = ?
                 WHERE approval_ref_hash = ?
                   AND consumed_at IS NULL
+                  AND revoked_at IS NULL
                   AND expires_at > ?
                 """,
                 (timestamp, approval_ref_hash, timestamp),

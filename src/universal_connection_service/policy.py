@@ -203,6 +203,8 @@ class ApprovalGrant(Model):
     capability: str = Field(min_length=1)
     operation: Operation
     expires_at: datetime = Field(alias="expiresAt")
+    operation_id: str | None = Field(alias="operationId", default=None, min_length=1, max_length=200)
+    binding_digest: str | None = Field(alias="bindingDigest", default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class ApprovalVerification(Model):

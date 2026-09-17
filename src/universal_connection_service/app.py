@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import os
@@ -8,6 +9,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI
 
 from .approvals import ApprovalStore, PersistentApprovalVerifier
+from .receipt_audit import run_receipt_audit_worker
+from .receipt_retention import run_receipt_retention_worker
+from .execution_api import build_execution_router, build_connection_execution_router
+from .effects import effects_from_env
 from .auto_connect import build_auto_connect_router
 from .build_auto_connect import BuildAwareAutoConnectOrchestrator, VerifiedBuildCoordinator
 from .build_pipeline import (
@@ -56,6 +61,7 @@ from .sandbox_policy_compiler import (
 )
 from .sandbox_tool_policy import SandboxToolPolicyService, build_sandbox_tool_policy_router
 from .service import ConnectionService
+from .execution import executor_from_env
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -66,12 +72,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _build_state_store():
-    if os.getenv("UCS_DATABASE_URL"):
-        return PostgresStateStore(config_from_env()), "postgres"
-    path = os.getenv("UCS_STATE_DB_PATH")
-    if path:
-        return SQLiteStateStore(path), "sqlite"
-    return None, "memory"
+    from .storage_runtime import build_state_store_from_env
+    return build_state_store_from_env()
 
 
 def _build_openapi_catalog():
@@ -282,10 +284,12 @@ sandbox_gateway_manager, sandbox_gateway_kind = _build_gateway_manager()
 sandbox_gateway_state = "pending" if sandbox_gateway_manager is not None else sandbox_gateway_kind
 service = ConnectionService(
     registry,
+    effect_catalog=effects_from_env(),
     approval_verifier=approval_verifier,
     audit_store=state_store,
     evidence_store=state_store,
     discovery_engine=discovery_engine,
+    durable_executor=executor_from_env(state_store),
 )
 mcp_validation_service = MCPValidationService(
     registry,
@@ -410,14 +414,32 @@ async def lifespan(app: FastAPI):
         except SandboxGatewayError:
             sandbox_gateway_state = "unavailable"
     package_rehydration = _rehydrate_packages()
-    yield
-    close = getattr(state_store, "close", None)
-    if close is not None:
-        close()
+    audit_stop = asyncio.Event()
+    audit_worker = (asyncio.create_task(run_receipt_audit_worker(state_store, audit_stop))
+                    if state_store is not None and state_store.receipts_durable else None)
+    retention_worker = (asyncio.create_task(run_receipt_retention_worker(
+        state_store, service.durable_executor.cipher, audit_stop))
+        if service.durable_executor is not None else None)
+    try:
+        yield
+    finally:
+        audit_stop.set()
+        if audit_worker is not None:
+            # Finish any in-flight database transaction before closing its pool.
+            await audit_worker
+        if retention_worker is not None:
+            await retention_worker
+        if service.durable_executor is not None:
+            service.durable_executor.witness.close()
+        close = getattr(state_store, "close", None)
+        if close is not None:
+            close()
 
 
 app = FastAPI(title="Universal Connection Service", version="0.1.0", lifespan=lifespan)
 app.include_router(build_control_plane_router(control_plane_service, control_plane_authenticator))
+app.include_router(build_execution_router(service, control_plane_authenticator))
+app.include_router(build_connection_execution_router(service, control_plane_authenticator))
 app.include_router(build_auto_connect_router(auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_policy_auto_connect_router(policy_auto_connect_orchestrator, control_plane_authenticator))
 app.include_router(build_sandbox_tool_policy_router(sandbox_policy_service, control_plane_authenticator))
@@ -457,8 +479,3 @@ def connectors():
 @app.post("/v1/connections/plan", response_model=ConnectionPlan)
 def plan(request: ConnectionRequest):
     return service.compiler.compile(request)
-
-
-@app.post("/v1/connections/execute", response_model=ConnectionResult)
-async def execute(request: ConnectionRequest, context: ExecutionContext):
-    return await service.execute(request, context)

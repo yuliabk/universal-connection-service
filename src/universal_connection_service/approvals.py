@@ -27,6 +27,9 @@ class ApprovalRecord(Model):
     expires_at: datetime = Field(alias="expiresAt")
     consumed_at: datetime | None = Field(alias="consumedAt", default=None)
     created_at: datetime = Field(alias="createdAt", default_factory=lambda: datetime.now(timezone.utc))
+    operation_id: str | None = Field(alias="operationId", default=None, min_length=1, max_length=200)
+    binding_digest: str | None = Field(alias="bindingDigest", default=None, pattern=r"^[a-f0-9]{64}$")
+    revoked_at: datetime | None = Field(alias="revokedAt", default=None)
 
     @classmethod
     def from_grant(cls, grant: ApprovalGrant) -> "ApprovalRecord":
@@ -40,6 +43,8 @@ class ApprovalRecord(Model):
             capability=grant.capability,
             operation=grant.operation,
             expiresAt=grant.expires_at,
+            operationId=grant.operation_id,
+            bindingDigest=grant.binding_digest,
         )
 
 
@@ -79,6 +84,8 @@ class PersistentApprovalVerifier:
         record = self.store.get_approval(approval_ref_hash(approval_id))
         if record is None:
             return ApprovalVerification(valid=False)
+        if record.revoked_at is not None:
+            return ApprovalVerification(valid=False, code="APPROVAL_REVOKED", message="Approval has been revoked")
         if record.consumed_at is not None:
             return ApprovalVerification(
                 valid=False,

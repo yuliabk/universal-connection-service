@@ -28,7 +28,8 @@ def config(*, auto_migrate=True):
 def test_postgres_v3_persists_workflow_and_claim_is_atomic_across_instances():
     store1 = PostgresStateStore(config(auto_migrate=True))
     store2 = PostgresStateStore(config(auto_migrate=False))
-    assert store1.schema_version() == LATEST_SCHEMA_VERSION == 3
+    assert store1.schema_version() == LATEST_SCHEMA_VERSION
+    assert LATEST_SCHEMA_VERSION >= 3  # workflow tables introduced in migration 3
 
     suffix = uuid4().hex
     organization_id = f"org-wf-{suffix}"

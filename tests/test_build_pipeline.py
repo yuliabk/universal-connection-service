@@ -68,7 +68,8 @@ def principal(*scopes):
         subject="owner",
         tokenId="owner-token",
         organizations=("org-1",),
-        scopes=scopes,
+        scopes=scopes + ("connections:execute",),
+        executionActors=(ActorRef(userId="u1", organizationId="org-1", agentId="a1"),),
     )
 
 
@@ -303,7 +304,8 @@ def test_auto_connect_builds_openapi_then_waits_for_normal_promotion(tmp_path):
             ),
         )
     )
-    assert ready.workflow.stage == "ready_to_execute"
+    assert ready.workflow.stage == "awaiting_effect_classification"
+    assert ready.workflow.next_action == "review_capability_effect"
     assert registry.trusted("records", "records.read", "org-1") is not None
     pins = [item for item in store.list_evidence("org-1") if item.payload.get("type") == "package_verification"]
     assert len(pins) == 1

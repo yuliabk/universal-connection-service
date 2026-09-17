@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 from datetime import datetime, timedelta, timezone
 
@@ -79,7 +80,9 @@ def service(*, policy=None, verifier=None):
     registry = ConnectorRegistry()
     connector = StubConnector()
     registry.register(Registration(connector=connector, status="trusted"))
-    return ConnectionService(registry, policy_engine=policy, approval_verifier=verifier), connector
+    svc = ConnectionService(registry, policy_engine=policy, approval_verifier=verifier)
+    approve_read(svc, request())
+    return svc, connector
 
 
 def grant(
@@ -136,14 +139,14 @@ def test_valid_approval_is_request_bound_and_single_use():
     svc, connector = service(verifier=verifier)
     req = request(capability="records.write", operation="update")
 
-    first = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
-    assert first.status == "success"
-    assert connector.calls == 1
-
-    second = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
-    assert second.status == "failed"
-    assert second.error.code == "APPROVAL_ALREADY_USED"
-    assert connector.calls == 1
+    assert asyncio.run(verifier.verify("ap-1", req)).valid
+    blocked = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
+    assert blocked.error.code == "DURABLE_EXECUTION_REQUIRED"
+    assert connector.calls == 0
+    # A legacy grant is still single-use, but cannot authorize unsafe writes.
+    assert asyncio.run(verifier.verify("ap-1", req)).valid
+    asyncio.run(verifier.consume("ap-1"))
+    assert asyncio.run(verifier.verify("ap-1", req)).code == "APPROVAL_ALREADY_USED"
 
 
 def test_approval_scope_mismatch_fails_before_execution():
@@ -153,7 +156,8 @@ def test_approval_scope_mismatch_fails_before_execution():
 
     result = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
     assert result.status == "failed"
-    assert result.error.code in {"APPROVAL_SCOPE_MISMATCH", "APPROVAL_INVALID"}
+    assert result.error.code == "DURABLE_EXECUTION_REQUIRED"
+    assert asyncio.run(verifier.verify("ap-1", req)).code in {"APPROVAL_SCOPE_MISMATCH", "APPROVAL_INVALID"}
     assert connector.calls == 0
 
 
@@ -166,7 +170,8 @@ def test_expired_approval_fails_before_execution():
 
     result = asyncio.run(svc.execute(req, context(approval_id="ap-1")))
     assert result.status == "failed"
-    assert result.error.code == "APPROVAL_EXPIRED"
+    assert result.error.code == "DURABLE_EXECUTION_REQUIRED"
+    assert asyncio.run(verifier.verify("ap-1", req)).code == "APPROVAL_EXPIRED"
     assert connector.calls == 0
 
 

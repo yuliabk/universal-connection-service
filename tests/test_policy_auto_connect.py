@@ -1,3 +1,4 @@
+from effect_helpers import approve_read
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -52,7 +53,8 @@ class NoopValidationService: pass
 
 
 def principal(*scopes):
-    return ControlPlanePrincipal(subject="operator", tokenId="operator-token", organizations=("org-1",), scopes=scopes)
+    return ControlPlanePrincipal(subject="operator", tokenId="operator-token", organizations=("org-1",),
+        scopes=scopes + ("connections:execute",), executionActors=(ActorRef(userId="u1", organizationId="org-1", agentId="a1"),))
 
 
 def request(request_id="req-policy-1"):
@@ -64,6 +66,7 @@ def stack(open_world=False):
     connector=ToolScopedSandboxedMCPConnector(SandboxedMCPConnectorConfig(connectorId="sandbox-records", serviceId="records", name="Records sandbox", version="1.0.0", bundleDigest="a"*64, bindings=(MCPToolBinding(capability="records.read", tool="records_read"),)), runner=runner)
     registry.register(Registration(connector=connector, status="trusted", organization_id="org-1"))
     service=ConnectionService(registry, approval_verifier=PersistentApprovalVerifier(store), audit_store=store, evidence_store=store)
+    approve_read(service, request())
     control=ControlPlaneService(registry=registry, connection_service=service, state_store=store, evidence_store=store, approval_store=store, mcp_validation_service=NoopValidationService())
     mounts=SandboxMountCatalog(); policy_service=SandboxToolPolicyService(registry=registry, evidence_store=store, approval_store=store, mount_catalog=mounts)
     compiler=LeastPrivilegePolicyCompiler(registry=registry, evidence_store=store, mount_catalog=mounts, policy_catalog=SandboxPolicyCatalog())
@@ -97,8 +100,18 @@ def test_policy_approval_activation_execution_and_reuse():
     store.close()
 
 
-def test_unresolved_policy_fails_closed_then_recompiles_after_operator_rule():
+def test_unresolved_policy_fails_closed_then_recompiles_after_operator_rule(monkeypatch):
     store, runner, compiler, orchestrator=stack(True); actor=principal("connectors:review","approvals:issue","connectors:promote"); req=request()
+    # Force equal timestamps and reverse lexical IDs: neither determines recency.
+    from datetime import datetime, timezone
+    append = store.append_evidence
+    sequence = iter(("z-first-policy", "a-second-policy"))
+    def append_with_tied_timestamp(record):
+        if record.payload.get("type") == "auto_connect_sandbox_policy_proposal":
+            record = record.model_copy(update={"created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                                               "evidence_id": next(sequence)})
+        return append(record)
+    monkeypatch.setattr(store, "append_evidence", append_with_tied_timestamp)
     started=asyncio.run(orchestrator.start(actor,AutoConnectStartCommand(request=req)))
     assert started.workflow.last_code=="SANDBOX_POLICY_RESOLUTION_REQUIRED" and runner.calls==0
     assert "egress_targets_unknown" in orchestrator.policy_status(actor,"org-1",started.workflow.workflow_id).proposal.unresolved_requirements

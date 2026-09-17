@@ -1,5 +1,7 @@
 __pycache__/
 .pytest_cache/
+.schemathesis/
 .venv/
 *.egg-info/
 .env
+dist/
