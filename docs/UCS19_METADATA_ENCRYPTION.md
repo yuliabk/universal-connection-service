@@ -14,7 +14,7 @@
 
 `metadata_storage.py` מספק מסמכים מוצפנים, directory מוצפן של tenants, אינדקסים אטומים, insert-if-absent, CAS, pagination וטרנזקציה משותפת לכמה מסמכים. כל פתיחת טרנזקציה מאמתת profile קיים, טביעת מפתח האינדקס ו־probe מוצפן. provisioning מפורש ואינו fallback ב־startup; profile חסר או שונה נחסם. מיגרציה 7 מוסיפה את שלוש הטבלאות, ללא שינוי נתונים קיימים.
 
-ב־rotation מפתח הנתונים הפעיל משתנה, אבל האינדקסים נשארים יציבים. מפתחות קודמים נדרשים עד השלמת re-encryption גם של directory ושל probe. אין עדיין כלי rotation של מסד שלם, ולכן אין להסיר מפתח ישן בהסתמך על בדיקות primitive בלבד.
+ב־rotation מפתח הנתונים הפעיל משתנה, אבל האינדקסים נשארים יציבים. מפתחות קודמים נדרשים עד השלמת re-encryption גם של directory ושל probe. rotate_metadata_batch מספק מעבר ואימות באצוות; אין להסיר מפתח ישן לפני מעבר מלא ואימות כמפורט בהמשך.
 
 ## שילוב שנותר לביצוע
 
@@ -82,4 +82,16 @@ runtime דוחה טבלאות legacy שמכילות נתונים, גם אם לצ
 
 `test_encrypted_execution_process.py` מריץ את תרחישי הקריסה הקיימים גם מול EncryptedStateStore ו־EncryptedDispatchWitness. תהליכי הבדיקה פותחים profiles קיימים ואינם מאתחלים או מאפסים אותם. ה־ledger של הספק נמצא בקובץ נפרד ונבדק אחרי מות התהליך.
 
-התרחישים כוללים עצירה לפני/אחרי intent, אחרי dispatch, אחרי witness, אחרי result ו־audit acknowledgement; קריסה מיד אחרי commit אצל הספק; pending עמיד; ותהליך ישן שנעצר לפני או אחרי השפעת הספק בזמן שתהליך נוסף מבצע replay מוגן. נבדקים מספר ההשפעות, זהות התוצאה, outbox והיעדר דריסת תוצאה סופית. מקומית עברו כל עשרת התרחישים ב־SQLite; וריאציות PostgreSQL רצות ב־CI.
+התרחישים כוללים עצירה לפני/אחרי intent, אחרי dispatch, אחרי witness, אחרי result ו־audit acknowledgement; קריסה מיד אחרי commit אצל הספק; pending עמיד; ותהליך ישן שנעצר לפני או אחרי השפעת הספק בזמן שתהליך נוסף מבצע replay מוגן. נבדקים מספר ההשפעות, זהות התוצאה, outbox והיעדר דריסת תוצאה סופית. כל עשרת התרחישים עברו ב־SQLite וב־PostgreSQL ב־CI של db5278c (565 בדיקות ללא דילוגים).
+
+## החלפת מפתחות metadata באצוות
+
+`metadata_rotation.rotate_metadata_batch(repository, cursor=None, limit=100, verify_only=False)` מטפל לכל היותר ב־limit רשומות בכל טרנזקציה. הוא עובר על מסמכים, directory של tenants ולבסוף probe של ה־profile. כל envelope מפוענח ומאומת לפני שימוש ב־keyId; החלפה משתמשת ב־CAS על הגרסה וה־ciphertext המקוריים. כשל אימות או CAS מבטל את כל האצווה. גוף המסמך וזהויות הפעולה אינם משתנים; רק גרסת האחסון והמעטפת מתעדכנות.
+
+RotationBatch מחזיר cursor להמשך, scanned, changed ו־key_counts של המעטפות המאומתות אחרי האצווה. יש להעביר את ה־cursor המוחזר לקריאה הבאה עד שהוא None. ניתן לשמור cursor ולחדש עם אותם profile, indexKey ומפתחות נתונים. cursor אינו אישור שורות שהתרחשו לפניו ואינו הוכחה שמותר להסיר מפתח.
+
+תהליך תחזוקה: להפיץ keyring עם המפתח החדש והישן לכל הקוראים, להעביר את כל ה־writers למפתח החדש, להריץ מעבר מלא בנפרד על primary ועל witness, ואז להריץ verify_only=True מההתחלה ולוודא שבכל האצוות מופיע רק המפתח החדש. יש לעצור writers ישנים לפני החלטת הסרה, או לבצע את התחזוקה כולה offline. יש לוודא גם שניתן לפתוח ולקרוא את שני המאגרים עם המפתחות המיועדים להישאר. החלפת indexKey אינה נתמכת.
+
+ה־repositories זמינים בממשק התחזוקה של store.repository ושל executor.witness.repository; אין endpoint ציבורי לסריקה או rotation. מפתחות ResultCipher הפנימיים נפרדים ואינם מוחלפים במהלך זה. גיבויים, WAL ועותקים ישנים עדיין עשויים להזדקק למפתחות קודמים. מעבר מוצלח אינו אישור למחוק מפתחות גיבוי.
+
+בדיקות test_metadata_rotation.py מכסות מעבר של receipt ו־witness תוך שמירת retry יחיד ואירוע audit, עצירה וחידוש, סריקת אימות ללא כתיבה ו־rollback של אצווה בעקבות ciphertext פגום או CAS שנכשל.
