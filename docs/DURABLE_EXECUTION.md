@@ -32,7 +32,7 @@ ConnectionService יבדוק receipt לפני צריכת אישור שכבר ש�
 - [x] G1: חוזים, receipt store, CAS ו־outbox טרנזקציוני בשני backends (001–003, 006–008); הראיות להלן מכסות את שכבת האחסון בלבד.
 - [x] G2: ConnectionService, אישורים קשורים ובדיקות הרשאה לפני IO (001–005); היקף וראיות להלן. reconciliation מומש בהמשך; מוכנות Production אינה כלולה באישור זה.
 - [x] G3: recovery, auto-connect, audit delivery וגבולות retention/retry (004–007).
-- [ ] G4: fault injection בין תהליכים, הרגרסיה ובדיקות הקבלה הטכניות עברו; סקירת Owner פתוחה (008).
+- [x] G4: fault injection בין תהליכים, הרגרסיה ובדיקות הקבלה הטכניות עברו; קבלת Owner אושרה ב־2026-09-17 (008).
 
 העלויות הן כתיבות database וקריאות reconciliation מוגבלות. מוכנות Production אינה נובעת ממעבר בדיקות יחידה; היא דורשת גם contract של ספק, פריסה, הצפנה ו־restore מוכחים. בשלב הבנייה משתמשים בנתונים וספקים סינתטיים בלבד.
 
@@ -244,6 +244,6 @@ README, SPEC, תיעוד מיגרציות ו־UCS19_RUNBOOK.md עודכנו לפ
 
 ## מצב מסירה נוכחי — 2026-09-17
 
-EncryptedStateStore ו־EncryptedDispatchWitness מחוברים ל־runtime, כולל provisioning מפורש, rotation באצוות ומעבר offline מאומת. CI של 0b3e7af עבר עם 621 בדיקות ללא דילוגים. זו ראיית SQLite/PostgreSQL, Docker ואריזת wheel, כולל קריסת תהליך במהלך migration ושימור receipt/provider/approval identity.
+EncryptedStateStore ו־EncryptedDispatchWitness מחוברים ל־runtime, כולל provisioning מפורש, rotation באצוות ומעבר offline מאומת. CI של 1616d3e עבר עם 621 בדיקות ללא דילוגים. זו ראיית SQLite/PostgreSQL, Docker ואריזת wheel, כולל קריסת תהליך במהלך migration ושימור receipt/provider/approval identity.
 
-מפת דרישות וגבולות הקבלה העדכנית נמצאת ב־UCS19_ACCEPTANCE.md. פרקי הראיות הקודמים הם היסטוריית העבודה; סטטוס ישן כגון “העבודה הבאה” אינו מבטל מימוש שתועד אחריו. סקירת Owner וקבלה סופית אינן מוסקות ממעבר CI, ופריסת Production דורשת היקף נפרד.
+מפת דרישות וגבולות הקבלה העדכנית נמצאת ב־UCS19_ACCEPTANCE.md. פרקי הראיות הקודמים הם היסטוריית העבודה; סטטוס ישן כגון “העבודה הבאה” אינו מבטל מימוש שתועד אחריו. ב־2026-09-17 ה־Owner השיב "יש לך אישור" לבקשת קבלת UCS-19 לאחר הצגת PR #19 וראיות 621 בדיקות שעברו ללא דילוגים. זהו אישור קבלה בשיחה; אינו אישור GitHub Review או פריסת Production. G4.3 נסגר; פריסת Production דורשת היקף נפרד.
