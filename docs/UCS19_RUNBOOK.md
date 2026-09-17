@@ -5,8 +5,8 @@
 ## לפני הפעלת כתיבה
 
 1. לבחור אחסון עמיד: UCS_STATE_DB_PATH עבור SQLite מקומי או UCS_DATABASE_URL עבור PostgreSQL. מצב זיכרון אינו מתאים ל־receipts עמידים.
-2. ב־PostgreSQL להריץ `ucs-db migrate` עם הרשאת DDL, ואז `ucs-db status`. גרסת הסכימה הנוכחית היא 7. מיגרציה 7 מכינה אחסון metadata מוצפן אך אינה מפעילה הצפנה ב־runtime הקיים; ראו UCS19_METADATA_ENCRYPTION.md. runtime רגיל אינו מריץ מיגרציות; גרסה ישנה נחסמת.
-3. להכין witness נפרד עבור keyspace חדש בלבד. SQLite: `python -m universal_connection_service.dispatch_witness --sqlite-path <new-path> --witness-id <deployment-id> --confirm-new-keyspace`. PostgreSQL: להחליף `--sqlite-path` ב־`--postgres-env <env-name>` למסד נפרד שכבר קיים. אין לאתחל witness חדש כפתרון ל־restore או quarantine.
+2. ב־PostgreSQL להריץ `ucs-db migrate` עם הרשאת DDL, ואז `ucs-db status`. גרסת הסכימה הנוכחית היא 7. מיגרציה 7 מכינה את הטבלאות; ה־runtime דורש גם profiles ומפתחות הצפנה כמפורט ב־UCS19_METADATA_ENCRYPTION.md. runtime רגיל אינו מריץ מיגרציות; גרסה ישנה נחסמת.
+3. למרחב חדש בלבד, לטעון UCS_METADATA_PROFILE_ID / UCS_METADATA_KEYRING_JSON ול־witness את UCS_WITNESS_METADATA_PROFILE_ID / UCS_WITNESS_METADATA_KEYRING_JSON ו־UCS_EXECUTION_WITNESS_ID. להריץ `python -m universal_connection_service.storage_runtime --role primary --sqlite-path <new-primary-path> --confirm-new-keyspace` ושוב עם `--role witness --sqlite-path <new-witness-path>`. PostgreSQL: להחליף `--sqlite-path` ב־`--postgres-env <env-name>` למסד ריק ונפרד שכבר קיים. אלה אינן פקודות migration או פתרון ל־restore/quarantine; אין למחוק נתונים קיימים.
 4. לטעון UCS_EXECUTION_WITNESS_ID ונתיב/DSN של witness קיים; לטעון UCS_RECEIPT_KEYRING_JSON ממנגנון סודות ו־UCS_EXECUTION_TARGETS_JSON עם חשבון, actor, capability וגרסת מחבר מאושרים. ראו את החוזים המדויקים ב־DURABLE_EXECUTION.md. אין לשמור מפתחות בקוד או בארגומנט shell גלוי.
 5. להגדיר UCS_CONTROL_PLANE_CREDENTIALS_JSON עם tokenSha256 ו־executionActors מפורשים. להגדיר UCS_CAPABILITY_EFFECTS_JSON לקריאות שעברו בדיקת host. אישור promotion או readOnly בבקשה אינם תחליף לסיווג effects.
 6. ספק שתומך ב־recovery דורש חוזה מקובע, ראיית בדיקה ואישור מפעיל. יש להתאים חלון dedup, notAfter, clockMarginMs, recoveryBackoffMs ותקציב lookup לספק בפועל. בדיקות ספק סינתטי אינן אישור לחוזה ספק אחר.
@@ -35,4 +35,4 @@ workers פנימיים מוסרים outbox ומוחקים ciphertext שפג. כ�
 
 יש לשמור את witness ולגבותו בנפרד מ־primary. אין לשחזר את שניהם לאותה נקודת עבר ואז לפתוח כתיבה. אובדן שני מקורות המידע אינו ניתן להכרעה מתוך UCS בלבד; נדרש רישום ספק/גיבוי סמכותי לפני חידוש כתיבה.
 
-תוצאות מוצפנות ב־AES-GCM עם הפרדת tenant ו־keyring המאפשר rotation. metadata במסד עדיין אינו מוצפן בשכבת האפליקציה: הצפנת דיסק/מסד/גיבויים, הגבלת הרשאות ומדיניות ניהול מפתחות לפריסה עדיין דורשות הכרעה וראיה. TLS בחיבור PostgreSQL אינו הוכחה להצפנה במנוחה.
+תוצאות מוצפנות ב־AES-GCM עם הפרדת tenant ו־keyring המאפשר rotation. metadata נשמר מוצפן ב־runtime עם profiles ומפתחות שהוכנו מראש. העברת נתונים ישנים עדיין לא הושלמה; עותקי legacy, WAL וגיבויים ישנים נשארים רגישים. גם הגבלת הרשאות ומדיניות ניהול מפתחות דורשות תצורת פריסה מתאימה. TLS בחיבור PostgreSQL אינו הוכחה להצפנה במנוחה.

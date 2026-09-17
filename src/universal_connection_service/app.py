@@ -72,12 +72,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _build_state_store():
-    if os.getenv("UCS_DATABASE_URL"):
-        return PostgresStateStore(config_from_env()), "postgres"
-    path = os.getenv("UCS_STATE_DB_PATH")
-    if path:
-        return SQLiteStateStore(path), "sqlite"
-    return None, "memory"
+    from .storage_runtime import build_state_store_from_env
+    return build_state_store_from_env()
 
 
 def _build_openapi_catalog():

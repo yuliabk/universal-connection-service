@@ -1,6 +1,6 @@
 # UCS-19 — השלמת הצפנת metadata
 
-מצב: תשתית ההצפנה חוברה לממשקי StateStore. גם ה־witness חובר לאחסון מוצפן עצמאי. חיבור runtime ומעבר נתונים קיימים טרם הושלמו. אין לטעון שהפעלת UCS הקיימת מצפינה metadata רק משום שמיגרציה 7 הותקנה.
+מצב: תשתית ההצפנה חוברה לממשקי StateStore. גם ה־witness חובר לאחסון מוצפן עצמאי. ה־runtime מחייב תצורת הצפנה ומסדים שהוכנו מראש. מעבר נתונים קיימים טרם הושלם. אין לטעון שהפעלת UCS הקיימת מצפינה metadata רק משום שמיגרציה 7 הותקנה.
 
 ## החלטת עבודה
 
@@ -33,7 +33,7 @@
 
 ## חיבור ממשקי הבקרה
 
-`EncryptedControlStore` מחבר כעת את ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore ו־WorkflowStore למסמכים מוצפנים, בלי ירושה או delegation לכתיבה בטבלאות הגלויות. ה־runtime אינו מפעיל אותו עדיין: תחילה יש להשלים ReceiptStore ו־witness תחת אותם גבולות טרנזקציה.
+`EncryptedControlStore` מחבר כעת את ConnectorStateStore, EvidenceStore, AuditStore, ApprovalStore ו־WorkflowStore למסמכים מוצפנים, בלי ירושה או delegation לכתיבה בטבלאות הגלויות. ה־runtime מפעיל אותו כחלק מ־EncryptedStateStore, יחד עם ReceiptStore ו־witness מוצפן עצמאי.
 
 האישורים נשמרים תחת tenant ומפתחים opaque. ממשק get_approval הקיים מקבל hash בלי organization; עבורו נשמר locator מוצפן במרחב host פנימי, שמצביע על tenant ונגיש רק לקוד האחסון. אין endpoint למציאת ארגון לפי locator. אותם locators שומרים על ייחודיות גלובלית קיימת של audit/evidence/workflow IDs. locator, המסמך וה־request alias של workflow נוצרים באותה טרנזקציה.
 
@@ -49,7 +49,7 @@
 
 גם notices, תקציבי recovery, backoff, quarantine ותצפית תפעולית משתמשים במסמכים מוצפנים. רשימות שומרות על סדר המזהים וה־cursor של הממשק הישן באמצעות פענוח באצוות ובחירת התוצאות המוגבלות בזיכרון; זמן הסריקה אינו מוגבל לגודל הדף המוחזר. כך נשמרת התאימות בלי לחשוף timestamps או מזהים באינדקסים גלויים, במחיר קריאות ופענוחים נוספים.
 
-הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; חיבור runtime, migration וכל מטריצת הקריסה בתהליכים נפרדים על שני האחסונים המוצפנים עדיין נדרשים.
+הבדיקות מפעילות את ConnectionService וה־DurableExecutor האמיתיים מעל StateStore המוצפן, כולל retry, lookup, replay, pending, expiry/revocation, CAS, אובדן acknowledgement, rollback של approval/attempt ושל completion/outbox, מסירת audit ו־retention. ה־witness בבדיקות אלה משתמש כעת במימוש המוצפן ובמסד נפרד, כמפורט בהמשך; migration וכל מטריצת הקריסה בתהליכים נפרדים על שני האחסונים המוצפנים עדיין נדרשים.
 
 ## witness מוצפן ועצמאי
 
@@ -57,4 +57,23 @@
 
 provisioning מתאפשר רק באזור מוצפן ריק, ללא נתוני primary קיימים או טבלאות witness ישנות. הוא אינו כלי migration או איפוס. identity נבדקת בכל טרנזקציה, ואיסור שיתוף מסד עם primary נשמר גם כשה־primary הוא EncryptedStateStore.
 
-בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. חיבור runtime, מעבר offline וראיות קריסה בתהליכים נפרדים כשההצפנה פעילה עדיין נדרשים.
+בדיקות חוזי הביצוע המוצפנים משתמשות כעת ב־witness מוצפן: ב־SQLite בקובץ עצמאי, וב־PostgreSQL במסד נפרד שנוצר ונמחק רק בתוך fixtures סינתטיים. נוספו בדיקות restore חסר/ישן, כשל witness ואובדן acknowledgement, קריאת אחסון ישירה ובדיקות זהות והפרדת מסדים. מעבר offline וראיות קריסה בתהליכים נפרדים כשההצפנה פעילה עדיין נדרשים.
+
+## הפעלה דרך runtime ואתחול מרחב חדש
+
+ה־runtime בוחר כעת EncryptedStateStore כאשר מוגדר אחסון מתמשך. יש לבחור בדיוק אחד מבין UCS_STATE_DB_PATH ו־UCS_DATABASE_URL, ולהגדיר UCS_METADATA_PROFILE_ID ו־UCS_METADATA_KEYRING_JSON. הנתיב/מסד וה־profile חייבים להתקיים מראש. SQLite נפתח ב־mode=rw ואינו יוצר קובץ חלופי כשנתיב שגוי. ללא תצורת אחסון כלל נשאר מצב memory, שאינו מאפשר ביצוע עסקי עמיד.
+
+מבנה ה־keyring הוא אובייקט JSON עם שלושה שדות בלבד: activeKey, keys ו־indexKey. keys ממפה מזהי מפתח ל־Base64 של 32 בתים אקראיים; activeKey מפנה למפתח פעיל. indexKey הוא Base64 של מפתח אקראי נפרד בן 32 בתים. שמות שדות כפולים, מפתח חסר או שימוש באותו חומר מפתח להצפנה ולאינדקס נדחים. יש לטעון את הערכים ממנגנון סודות, בלי להעביר אותם בארגומנטים או לשמור אותם במאגר.
+
+ל־witness מוגדרים בנפרד UCS_WITNESS_METADATA_PROFILE_ID ו־UCS_WITNESS_METADATA_KEYRING_JSON, בנוסף ל־UCS_EXECUTION_WITNESS_ID ולנתיב/DSN הקיימים. executor_from_env דורש primary מוצפן ו־witness מוצפן; מפתחות payload ב־UCS_RECEIPT_KEYRING_JSON נשארים נפרדים. PostgreSQL ממשיך לדרוש witness במסד PostgreSQL נפרד.
+
+אתחול למרחב חדש בלבד, לאחר טעינת משתני המפתחות והזהויות:
+
+```text
+python -m universal_connection_service.storage_runtime --role primary --sqlite-path <new-primary-path> --confirm-new-keyspace
+python -m universal_connection_service.storage_runtime --role witness --sqlite-path <new-witness-path> --confirm-new-keyspace
+```
+
+ב־PostgreSQL מחליפים את --sqlite-path ב־--postgres-env עם שם משתנה סביבה שמכיל DSN של מסד ריק שכבר נוצר. פקודת provisioning מריצה את מיגרציות הסכימה; נדרשת עבורה הרשאת DDL. היא אינה מאתחלת profile קיים ואינה משמשת לעקיפת quarantine. כשל provisioning יכול להשאיר קובץ חדש ריק/חלקי לבדיקה, אך startup לא ישתמש בו ללא profile ו־witness תקינים.
+
+runtime דוחה טבלאות legacy שמכילות נתונים, גם אם לצדן קיים profile מוצפן תקין. הוא גם דוחה מסד witness המשמש כ־primary. זה שינוי מכוון מהפעלת UCS_STATE_DB_PATH לבדה: אין fallback לכתיבה גלויה ואין אימוץ אוטומטי של keyspace ישן. נתונים קיימים דורשים מעבר offline שעדיין בבנייה; אין למחוק אותם כדי לעבור את בדיקת האתחול.

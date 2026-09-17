@@ -183,10 +183,11 @@ class StateStore(ConnectorStateStore, EvidenceStore, AuditStore, WorkflowStore, 
 class SQLiteStateStore(SQLReceiptStore):
     """SQLite reference store for UCS control-plane state."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, must_exist: bool = False) -> None:
         self.path = str(path)
         self._lock = RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        source = Path(self.path).resolve().as_uri() + "?mode=rw" if must_exist else self.path
+        self._connection = sqlite3.connect(source, check_same_thread=False, uri=must_exist)
         self._connection.row_factory = sqlite3.Row
         with self._lock:
             self._connection.execute("PRAGMA foreign_keys = ON")

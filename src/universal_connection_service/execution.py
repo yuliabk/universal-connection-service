@@ -314,23 +314,35 @@ class DurableExecutor:
             elif hashlib.sha256(ctx.credential_handle.get_secret_value().encode()).hexdigest() not in target.credential_handle_hashes:
                 raise ReceiptError("EXECUTION_ACCOUNT_MISMATCH")
             receipt = self.store.get_receipt(req.actor.organization_id, req.operation_id)
-            digest = execution_binding(req, target.provider_account_id,
-                schema_version=receipt.binding_schema_version if receipt else 1)
-            if receipt:
-                if (receipt.user_id, receipt.agent_id) != (req.actor.user_id, req.actor.agent_id):
-                    receipt = None
-                    raise ReceiptError("EXECUTION_TARGET_DENIED")
-                if receipt.binding_digest != digest:
-                    raise ReceiptError("IDEMPOTENCY_CONFLICT")
-                self.witness.check(req.actor.organization_id, req.operation_id, receipt)
-                if receipt.state != "prepared":
-                    if replay and allow_dispatch and receipt.state not in {"succeeded", "failed_no_effect"}:
-                        return await self._replay(req, ctx, registration, target, receipt)
-                    if reconcile and receipt.state not in {"succeeded", "failed_no_effect"}:
-                        return await self._reconcile(req, ctx, registration, target, receipt)
-                    return self._cached(req, receipt)
-            else:
-                self.witness.check(req.actor.organization_id, req.operation_id, None)
+            # Primary and witness are independent databases. Re-read a changed
+            # primary snapshot before treating a concurrent dispatch as restore.
+            for snapshot_attempt in range(3):
+                digest = execution_binding(req, target.provider_account_id,
+                    schema_version=receipt.binding_schema_version if receipt else 1)
+                if receipt:
+                    if (receipt.user_id, receipt.agent_id) != (req.actor.user_id, req.actor.agent_id):
+                        receipt = None
+                        raise ReceiptError("EXECUTION_TARGET_DENIED")
+                    if receipt.binding_digest != digest:
+                        raise ReceiptError("IDEMPOTENCY_CONFLICT")
+                try:
+                    self.witness.check(req.actor.organization_id, req.operation_id, receipt)
+                    break
+                except ReceiptError as exc:
+                    if exc.code != "EXECUTION_RESTORE_QUARANTINED":
+                        raise
+                    current = self.store.get_receipt(req.actor.organization_id, req.operation_id)
+                    if current == receipt:
+                        raise
+                    if snapshot_attempt == 2:
+                        raise ReceiptError("OUTCOME_UNKNOWN") from exc
+                    receipt = current
+            if receipt and receipt.state != "prepared":
+                if replay and allow_dispatch and receipt.state not in {"succeeded", "failed_no_effect"}:
+                    return await self._replay(req, ctx, registration, target, receipt)
+                if reconcile and receipt.state not in {"succeeded", "failed_no_effect"}:
+                    return await self._reconcile(req, ctx, registration, target, receipt)
+                return self._cached(req, receipt)
             if not allow_dispatch or reconcile or replay:
                 return self._error(req, "RECEIPT_NOT_DISPATCHED", receipt)
             if (registration.manifest.connector_id, registration.manifest.version) != (target.connector_id, target.connector_version):
@@ -382,17 +394,23 @@ def executor_from_env(store) -> DurableExecutor | None:
     witness_path = os.getenv("UCS_EXECUTION_WITNESS_PATH")
     witness_url = os.getenv("UCS_EXECUTION_WITNESS_POSTGRES_URL")
     witness_id = os.getenv("UCS_EXECUTION_WITNESS_ID")
-    if not any((target_json, keyring_json, witness_path, witness_url, witness_id)):
+    metadata_configured = any(os.getenv(name) is not None for name in
+        ("UCS_WITNESS_METADATA_PROFILE_ID", "UCS_WITNESS_METADATA_KEYRING_JSON"))
+    if not any((target_json, keyring_json, witness_path, witness_url, witness_id, metadata_configured)):
         return None
     witness_store = None
     try:
+        from .encrypted_receipt_store import EncryptedStateStore
+        from .storage_runtime import metadata_configuration, open_runtime_witness
+        if not isinstance(store, EncryptedStateStore):
+            raise ValueError("encrypted runtime state required")
+        metadata_configuration("UCS_WITNESS_METADATA")
         if not target_json or not keyring_json or store is None or not store.receipts_durable:
             raise ValueError("incomplete durable execution configuration")
         config = json.loads(keyring_json)
         keys = {name: base64.b64decode(value, validate=True) for name, value in config["keys"].items()}
         if not witness_id or bool(witness_path) == bool(witness_url):
             raise ValueError("independent witness configuration required")
-        from .dispatch_witness import DispatchWitness
         if witness_url:
             from .postgres_store import PostgresStateStore, PostgresStoreConfig
             from pydantic import SecretStr
@@ -402,8 +420,8 @@ def executor_from_env(store) -> DurableExecutor | None:
             from .persistence import SQLiteStateStore
             if hasattr(store, "config") or not Path(witness_path).is_file():
                 raise ValueError("PostgreSQL execution requires a separately provisioned PostgreSQL witness")
-            witness_store = SQLiteStateStore(witness_path)
-        witness = DispatchWitness(witness_store, witness_id)
+            witness_store = SQLiteStateStore(witness_path, must_exist=True)
+        witness = open_runtime_witness(witness_store, witness_id)
         return DurableExecutor(store, ResultCipher(keys, config["activeKey"]),
                                tuple(ExecutionTarget.model_validate(t) for t in json.loads(target_json)), witness=witness)
     except Exception:

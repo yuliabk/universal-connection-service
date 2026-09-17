@@ -125,14 +125,24 @@ def test_host_configuration_requires_existing_witness_and_matching_identity(tmp_
     import json
     from test_durable_execution import make_target
     from universal_connection_service.execution import executor_from_env
-    primary = SQLiteStateStore(tmp_path / "primary.sqlite3")
+    from universal_connection_service.metadata_storage import MetadataRepository
+    from universal_connection_service.encrypted_receipt_store import EncryptedStateStore
+    from universal_connection_service.encrypted_witness import EncryptedDispatchWitness
+    from test_metadata_storage import cipher
+    physical = SQLiteStateStore(tmp_path / "primary.sqlite3")
+    MetadataRepository.provision(physical, cipher(), "primary-profile")
+    primary = EncryptedStateStore(MetadataRepository(physical, cipher(), "primary-profile"))
     backing = SQLiteStateStore(tmp_path / "witness.sqlite3")
-    DispatchWitness.initialize(backing, "deployment-1")
+    MetadataRepository.provision(backing, cipher(), "witness-profile")
+    EncryptedDispatchWitness.initialize(MetadataRepository(backing, cipher(), "witness-profile"), "deployment-1")
     backing.close()
     monkeypatch.delenv("UCS_EXECUTION_WITNESS_POSTGRES_URL", raising=False)
     monkeypatch.setenv("UCS_EXECUTION_TARGETS_JSON", json.dumps([make_target(request()).model_dump(by_alias=True)]))
     monkeypatch.setenv("UCS_RECEIPT_KEYRING_JSON", json.dumps({"activeKey": "test", "keys": {"test": base64.b64encode(b"x" * 32).decode()}}))
     monkeypatch.setenv("UCS_EXECUTION_WITNESS_ID", "deployment-1")
+    monkeypatch.setenv("UCS_WITNESS_METADATA_PROFILE_ID", "witness-profile")
+    monkeypatch.setenv("UCS_WITNESS_METADATA_KEYRING_JSON", json.dumps({"activeKey": "initial",
+        "keys": {"initial": base64.b64encode(b"d" * 32).decode()}, "indexKey": base64.b64encode(b"i" * 32).decode()}))
     missing = tmp_path / "missing.sqlite3"
     monkeypatch.setenv("UCS_EXECUTION_WITNESS_PATH", str(missing))
     with pytest.raises(RuntimeError, match="configuration is invalid"):
@@ -145,3 +155,28 @@ def test_host_configuration_requires_existing_witness_and_matching_identity(tmp_
     with pytest.raises(RuntimeError, match="configuration is invalid"):
         executor_from_env(primary)
     primary.close()
+
+
+def test_concurrent_completion_between_primary_read_and_witness_check(stores, monkeypatch):
+    first_store, second_store = stores(), stores()
+    req = request()
+    raw = approve(first_store, req, raw=req.actor.organization_id)
+    first, first_provider = build_service(first_store, req)
+    second, second_provider = build_service(second_store, req)
+    witness = first.durable_executor.witness
+    check = witness.check
+    advanced = False
+
+    def advance_before_check(org, operation, receipt):
+        nonlocal advanced
+        if not advanced:
+            advanced = True
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                assert pool.submit(execute, second, req, raw).result().status == "success"
+        return check(org, operation, receipt)
+
+    monkeypatch.setattr(witness, "check", advance_before_check)
+    result = execute(first, req, raw)
+    assert result.status == "success", result
+    assert first_provider.calls == 0 and second_provider.calls == 1

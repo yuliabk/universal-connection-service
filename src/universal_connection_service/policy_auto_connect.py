@@ -80,6 +80,7 @@ class PolicyAwareAutoConnectOrchestrator(SandboxBuildAwareAutoConnectOrchestrato
                 connectorId=proposal.connector_id,
                 payload={
                     "type": _POLICY_EVIDENCE_TYPE,
+                    "workflowRevision": record.revision,
                     "proposal": proposal.model_dump(by_alias=True, mode="json"),
                 },
             )
@@ -98,7 +99,7 @@ class PolicyAwareAutoConnectOrchestrator(SandboxBuildAwareAutoConnectOrchestrato
         ]
         if not matches:
             return None
-        matches.sort(key=lambda item: (item.created_at, item.evidence_id))
+        matches.sort(key=lambda item: (item.payload.get("workflowRevision", -1), item.created_at, item.evidence_id))
         try:
             return SandboxPolicyProposal.model_validate(matches[-1].payload["proposal"])
         except Exception:

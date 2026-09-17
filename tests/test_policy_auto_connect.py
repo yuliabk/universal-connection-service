@@ -100,8 +100,18 @@ def test_policy_approval_activation_execution_and_reuse():
     store.close()
 
 
-def test_unresolved_policy_fails_closed_then_recompiles_after_operator_rule():
+def test_unresolved_policy_fails_closed_then_recompiles_after_operator_rule(monkeypatch):
     store, runner, compiler, orchestrator=stack(True); actor=principal("connectors:review","approvals:issue","connectors:promote"); req=request()
+    # Force equal timestamps and reverse lexical IDs: neither determines recency.
+    from datetime import datetime, timezone
+    append = store.append_evidence
+    sequence = iter(("z-first-policy", "a-second-policy"))
+    def append_with_tied_timestamp(record):
+        if record.payload.get("type") == "auto_connect_sandbox_policy_proposal":
+            record = record.model_copy(update={"created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                                               "evidence_id": next(sequence)})
+        return append(record)
+    monkeypatch.setattr(store, "append_evidence", append_with_tied_timestamp)
     started=asyncio.run(orchestrator.start(actor,AutoConnectStartCommand(request=req)))
     assert started.workflow.last_code=="SANDBOX_POLICY_RESOLUTION_REQUIRED" and runner.calls==0
     assert "egress_targets_unknown" in orchestrator.policy_status(actor,"org-1",started.workflow.workflow_id).proposal.unresolved_requirements

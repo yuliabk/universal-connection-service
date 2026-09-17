@@ -33,6 +33,8 @@ python -m venv .venv
 
 תיעוד API נמצא ב־`http://127.0.0.1:8000/docs`. ללא תצורה מפורשת אין הרשאה לביצוע עסקי. התקנת dev כוללת תלויות מתאמים ובדיקות; PostgreSQL ו־Docker עצמם נדרשים בנפרד לבדיקות האינטגרציה המתאימות.
 
+אחסון מתמשך מחייב כעת profile ומפתחות metadata, וגם witness מוצפן לכתיבה. ראו [פקודות אתחול ותצורה](docs/UCS19_METADATA_ENCRYPTION.md); הגדרת נתיב או DSN לבדה אינה מספיקה. נתוני legacy מחייבים מעבר מבוקר ואינם מאומצים אוטומטית.
+
 ## ממשקים ובטיחות ביצוע
 
 `GET /health`, `GET /v1/connectors` ו־`POST /v1/connections/plan` מספקים בריאות, metadata ותכנון. `POST /v1/connections/execute` מחייב bearer, scope connections:execute וצירוף actor מאושר. תכנון כשלעצמו אינו היתר ביצוע.

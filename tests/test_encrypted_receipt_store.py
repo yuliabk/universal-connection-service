@@ -184,3 +184,8 @@ def test_encrypted_payload_purge_does_not_remove_identity_or_audit(encrypted_sto
     assert len(store.pending_receipt_audit(intent.organization_id)) == 1
     with pytest.raises(ReceiptError, match="RECEIPT_STATE_CONFLICT"):
         store.begin_dispatch(intent.organization_id, intent.operation_id, final.version + 1, "retry")
+
+
+def test_encrypted_concurrent_completion_during_witness_check(encrypted_stores, monkeypatch):
+    from test_dispatch_witness import test_concurrent_completion_between_primary_read_and_witness_check
+    test_concurrent_completion_between_primary_read_and_witness_check(encrypted_stores, monkeypatch)
