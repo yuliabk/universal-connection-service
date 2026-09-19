@@ -4,6 +4,8 @@ on:
   pull_request:
 permissions:
   contents: read
+  # Temporary: the failure-reporting step below comments on the PR.
+  pull-requests: write
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -32,4 +34,22 @@ jobs:
       - run: python -m pip install -e '.[dev]'
       - name: Pre-pull MCPB sandbox image
         run: docker pull python:3.12-slim
-      - run: python -m pytest -q
+      - name: Run tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee /tmp/pytest.log
+      - name: Report test failure on the PR (temporary debug step)
+        if: failure() && github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "### CI failure output (temporary debug step)"
+            echo ""
+            echo '```'
+            tail -c 50000 /tmp/pytest.log
+            echo '```'
+          } > /tmp/comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md
