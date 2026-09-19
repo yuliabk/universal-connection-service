@@ -16,7 +16,11 @@ from universal_connection_service.openapi_validation import (
     OpenAPIValidationService,
 )
 from universal_connection_service.persistence import SQLiteStateStore
-from universal_connection_service.policy import ApprovalGrant, InMemoryApprovalVerifier
+from universal_connection_service.policy import (
+    ApprovalGrant,
+    InMemoryApprovalVerifier,
+    approval_input_digest,
+)
 from universal_connection_service.registry import ConnectorRegistry, Registration
 from universal_connection_service.service import ConnectionService
 
@@ -227,6 +231,7 @@ def test_approval_evidence_and_audit_store_only_hashed_reference():
                 capability="records.write",
                 operation="update",
                 expiresAt=datetime.now(timezone.utc) + timedelta(minutes=5),
+                inputDigest=approval_input_digest({}),
             ),
         )
     )

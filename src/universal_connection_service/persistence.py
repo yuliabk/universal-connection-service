@@ -257,6 +257,7 @@ class SQLiteStateStore:
                 capability TEXT NOT NULL,
                 operation TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
+                input_digest TEXT,
                 consumed_at TEXT,
                 created_at TEXT NOT NULL
             );
@@ -521,8 +522,8 @@ class SQLiteStateStore:
                 INSERT INTO approval_grant (
                     approval_ref_hash, request_id, organization_id, user_id,
                     agent_id, service_id, capability, operation, expires_at,
-                    consumed_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    input_digest, consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (approval_ref_hash) DO NOTHING
                 """,
                 (
@@ -535,6 +536,7 @@ class SQLiteStateStore:
                     record.capability,
                     record.operation,
                     record.expires_at.isoformat(),
+                    record.input_digest,
                     record.consumed_at.isoformat() if record.consumed_at else None,
                     record.created_at.isoformat(),
                 ),
@@ -560,6 +562,7 @@ class SQLiteStateStore:
             capability=row["capability"],
             operation=row["operation"],
             expiresAt=datetime.fromisoformat(row["expires_at"]),
+            inputDigest=row["input_digest"],
             consumedAt=datetime.fromisoformat(row["consumed_at"]) if row["consumed_at"] else None,
             createdAt=datetime.fromisoformat(row["created_at"]),
         )

@@ -123,6 +123,7 @@ _MIGRATIONS = (
                 capability TEXT NOT NULL,
                 operation TEXT NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
+                input_digest TEXT,
                 consumed_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL
             )
@@ -499,8 +500,8 @@ class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, Approva
                 INSERT INTO ucs_internal.approval_grant (
                     approval_ref_hash, request_id, organization_id, user_id,
                     agent_id, service_id, capability, operation, expires_at,
-                    consumed_at, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    input_digest, consumed_at, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (approval_ref_hash) DO NOTHING
                 """,
                 (
@@ -513,6 +514,7 @@ class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, Approva
                     record.capability,
                     record.operation,
                     record.expires_at,
+                    record.input_digest,
                     record.consumed_at,
                     record.created_at,
                 ),
@@ -536,6 +538,7 @@ class PostgresStateStore(ConnectorStateStore, EvidenceStore, AuditStore, Approva
             capability=row["capability"],
             operation=row["operation"],
             expiresAt=self._dt(row["expires_at"]),
+            inputDigest=row["input_digest"],
             consumedAt=self._dt(row["consumed_at"]),
             createdAt=self._dt(row["created_at"]),
         )
