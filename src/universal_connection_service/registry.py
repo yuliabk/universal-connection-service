@@ -9,6 +9,24 @@ from .persistence import ConnectorStateRecord, ConnectorStateStore
 GLOBAL_ORGANIZATION = "*"
 
 
+def _version_key(version: str) -> tuple:
+    """Order versions numerically, not lexicographically.
+
+    String ordering puts 1.9.0 above 1.10.0, so the tenth release of a connector
+    would never be selected. Numeric segments are compared as numbers; a
+    non-numeric suffix falls back to string comparison after them.
+    """
+    numeric: list[int] = []
+    rest = ""
+    for index, part in enumerate(str(version).split(".")):
+        if part.isdigit():
+            numeric.append(int(part))
+            continue
+        rest = ".".join(str(version).split(".")[index:])
+        break
+    return (tuple(numeric), rest)
+
+
 @dataclass
 class Registration:
     connector: ConnectorContract
@@ -93,7 +111,7 @@ class ConnectorRegistry:
             items,
             key=lambda item: (
                 item.organization_id == organization_id,
-                item.manifest.version,
+                _version_key(item.manifest.version),
             ),
         )[-1]
 
