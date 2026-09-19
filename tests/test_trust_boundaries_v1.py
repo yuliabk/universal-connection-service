@@ -275,3 +275,32 @@ def test_deadline_is_bounded():
 
     with pytest.raises(ValidationError):
         ExecutionContext(requestId="r", userId="u", organizationId=ORG, deadlineMs=86_400_000)
+
+
+# --- a raising connector is a failed result, not an exception ------------
+
+
+class ExplodingConnector(RecordsConnector):
+    async def execute(self, capability, input, ctx):
+        raise RuntimeError("upstream socket closed")
+
+
+def test_connector_exception_becomes_a_failed_result_and_is_audited():
+    store = SQLiteStateStore(":memory:")
+    registry = ConnectorRegistry()
+    registry.register(
+        Registration(
+            connector=ExplodingConnector(capabilities=("records.read",)),
+            status="trusted",
+            organization_id=ORG,
+        )
+    )
+    svc = ConnectionService(registry, audit_store=store, evidence_store=store)
+
+    result = asyncio.run(svc.execute(request(capability="records.read"), context()))
+
+    assert result.status == "failed"
+    assert result.error.code == "CONNECTOR_EXECUTION_FAILED"
+    assert result.error.retryable is True
+    assert "socket" not in result.error.message  # upstream detail stays out of the caller's view
+    assert store.list_audit(ORG, request_id="r-1")  # the attempt is on the record
