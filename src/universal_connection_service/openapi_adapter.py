@@ -11,6 +11,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import Field, field_validator, model_validator
 
+from .capability_schemas import CapabilitySchema, permissive_envelope, schemas_from_openapi
 from .contracts import (
     AuthRequirement,
     ConnectionError,
@@ -60,6 +61,9 @@ class OpenAPIOperationBinding(Model):
     path: str = Field(min_length=1)
     accepts_json_body: bool = Field(alias="acceptsJsonBody", default=False)
     auth: AuthRequirement = AuthRequirement()
+    # Published argument contract for agent-facing callers. Optional so that
+    # connector packages written before the tool catalog still load.
+    capability_schema: CapabilitySchema | None = Field(alias="capabilitySchema", default=None)
 
 
 class OpenAPIConnectorConfig(Model):
@@ -110,6 +114,28 @@ class OpenAPIConnectorAdapter:
             capabilities=tuple(self._bindings),
             auth=self.config.auth,
         )
+
+    def capability_schemas(self) -> tuple[CapabilitySchema, ...]:
+        """Argument contracts for the capabilities this connector exposes.
+
+        A binding compiled before the tool catalog carries no schema, so it
+        degrades to the permissive envelope rather than disappearing.
+        """
+        schemas: list[CapabilitySchema] = []
+        for capability, binding in self._bindings.items():
+            if binding.capability_schema is not None:
+                schemas.append(binding.capability_schema)
+                continue
+            schemas.append(
+                CapabilitySchema(
+                    capability=capability,
+                    description=f"{self.config.name}: {binding.operation_id}",
+                    operation="read" if binding.method in {"GET", "HEAD", "OPTIONS"} else "execute",
+                    readOnly=binding.method in {"GET", "HEAD", "OPTIONS"},
+                    inputSchema=permissive_envelope(),
+                )
+            )
+        return tuple(schemas)
 
     async def health_check(self, ctx: ExecutionContext) -> bool:
         # Generated connectors deliberately avoid probing arbitrary operations:
@@ -360,6 +386,10 @@ def compile_openapi_connector(
     _reject_remote_refs(schema)
     validate_openapi_spec(schema)
 
+    # Derived once for the whole document so every binding can publish the
+    # argument contract the spec declares instead of discarding it.
+    derived_schemas = {item.capability: item for item in schemas_from_openapi(schema)}
+
     bindings: list[OpenAPIOperationBinding] = []
     skipped: list[str] = []
     for path, path_item in schema.get("paths", {}).items():
@@ -389,6 +419,7 @@ def compile_openapi_connector(
                     path=path,
                     acceptsJsonBody=accepts_json,
                     auth=_security_auth(schema, operation),
+                    capabilitySchema=derived_schemas.get(capability),
                 )
             )
 

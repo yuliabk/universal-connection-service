@@ -10,7 +10,15 @@ from uuid import uuid4
 
 from pydantic import Field
 
-from .contracts import ConnectionRequest, DiscoveryCandidateRef, ExecutionContext, Model, Operation
+from .capability_schemas import CapabilitySchema
+from .contracts import (
+    ConnectionRequest,
+    DiscoveryCandidateRef,
+    ExecutionContext,
+    Model,
+    Operation,
+    RiskHints,
+)
 from .credentials import CredentialResolutionError, CredentialResolver, CredentialTarget
 from .mcp_adapter import MCPConnectorAdapter, MCPConnectorConfig, MCPHTTPConfig, MCPToolBinding
 from .persistence import EvidenceRecord, EvidenceStore
@@ -39,6 +47,10 @@ class MCPToolSnapshot(Model):
     title: str | None = None
     description: str | None = None
     input_schema_sha256: str = Field(alias="inputSchemaSha256", min_length=64, max_length=64)
+    # Kept alongside the digest: the digest detects drift, the schema itself is
+    # what an agent needs in order to call the tool. Already size-bounded by
+    # MAX_TOOL_METADATA_BYTES in _snapshot_tool.
+    input_schema: dict[str, Any] | None = Field(alias="inputSchema", default=None)
     output_schema_sha256: str | None = Field(alias="outputSchemaSha256", default=None)
     required_inputs: tuple[str, ...] = Field(alias="requiredInputs", default=())
     read_only_hint: bool | None = Field(alias="readOnlyHint", default=None)
@@ -163,6 +175,7 @@ def _snapshot_tool(tool: Any) -> MCPToolSnapshot:
         title=_clip(payload.get("title"), 256),
         description=_clip(payload.get("description"), MAX_DESCRIPTION_CHARS),
         inputSchemaSha256=_schema_digest(input_schema),
+        inputSchema=input_schema if isinstance(input_schema, dict) else None,
         outputSchemaSha256=_schema_digest(output_schema) if output_schema is not None else None,
         requiredInputs=required_inputs,
         readOnlyHint=optional_bool("readOnlyHint"),
@@ -329,6 +342,30 @@ class MCPToolIntrospector:
         return tuple(tools)
 
 
+def _capability_schema_for(
+    capability: str,
+    tools: tuple[MCPToolSnapshot, ...],
+    chosen: str,
+) -> CapabilitySchema | None:
+    """Turn the selected tool's introspected metadata into a published contract.
+
+    Hints are advisory: a server that says nothing about read-only or
+    destructive behaviour is treated as not read-only and not destructive here,
+    because risk classification stays with the policy engine.
+    """
+    snapshot = next((item for item in tools if item.name == chosen), None)
+    if snapshot is None or snapshot.input_schema is None:
+        return None
+    return CapabilitySchema(
+        capability=capability,
+        description=snapshot.description or snapshot.title or chosen,
+        operation="read" if snapshot.read_only_hint else "execute",
+        readOnly=bool(snapshot.read_only_hint),
+        riskHints=RiskHints(destructive=bool(snapshot.destructive_hint)),
+        inputSchema=snapshot.input_schema,
+    )
+
+
 class MCPValidationService:
     """Validate a discovered MCP endpoint and produce a non-trusted validated connector."""
 
@@ -456,7 +493,13 @@ class MCPValidationService:
             serviceId=self._service_id(request),
             name=candidate.name,
             version=candidate.version,
-            bindings=(MCPToolBinding(capability=request.capability, tool=chosen),),
+            bindings=(
+                MCPToolBinding(
+                    capability=request.capability,
+                    tool=chosen,
+                    capabilitySchema=_capability_schema_for(request.capability, tools, chosen),
+                ),
+            ),
             endpoint=MCPHTTPConfig(url=candidate.endpoint),
             auth=candidate.auth_requirement,
         )
