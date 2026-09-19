@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -74,6 +75,7 @@ class OpenAPIConnectorConfig(Model):
     endpoint: OpenAPIEndpoint
     bindings: tuple[OpenAPIOperationBinding, ...] = Field(min_length=1)
     auth: AuthRequirement = AuthRequirement()
+    max_response_bytes: int = Field(alias="maxResponseBytes", default=1_048_576, ge=1024, le=33_554_432)
 
     @model_validator(mode="after")
     def unique_capabilities(self):
@@ -247,15 +249,27 @@ class OpenAPIConnectorAdapter:
             )
         assert rendered_path is not None
 
+        oversized = False
         try:
             async with asyncio.timeout(ctx.deadline_ms / 1000):
                 async with self._client(binding, ctx) as client:
-                    response = await client.request(
+                    # Streamed and capped: reading an unbounded body into memory
+                    # lets one upstream response take the process down.
+                    async with client.stream(
                         binding.method,
                         rendered_path,
                         params=query or None,
                         json=body if body is not None else None,
-                    )
+                    ) as response:
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > self.config.max_response_bytes:
+                                oversized = True
+                                break
+                            chunks.append(chunk)
+                        raw = b"".join(chunks)
         except CredentialResolutionError as exc:
             return ConnectorResult(
                 status="failed",
@@ -284,6 +298,15 @@ class OpenAPIConnectorAdapter:
                 ),
             )
 
+        if oversized:
+            return ConnectorResult(
+                status="failed",
+                error=ConnectionError(
+                    code="UPSTREAM_RESPONSE_TOO_LARGE",
+                    message="Upstream response exceeded the allowed size",
+                ),
+            )
+
         if response.status_code >= 400:
             return ConnectorResult(
                 status="failed",
@@ -295,9 +318,10 @@ class OpenAPIConnectorAdapter:
             )
 
         content_type = response.headers.get("content-type", "").lower()
+        text = raw.decode(response.encoding or "utf-8", errors="replace")
         if "json" in content_type:
             try:
-                payload: Any = response.json()
+                payload: Any = json.loads(text)
             except ValueError:
                 return ConnectorResult(
                     status="failed",
@@ -307,7 +331,7 @@ class OpenAPIConnectorAdapter:
                     ),
                 )
         else:
-            payload = response.text
+            payload = text
 
         return ConnectorResult(
             status="success",
