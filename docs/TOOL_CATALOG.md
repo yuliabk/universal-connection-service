@@ -211,9 +211,43 @@ without learning the REST shape. `initialize`, `notifications/initialized`,
 Both surfaces call the same `ToolExecutor`, so allowlist, argument validation,
 run budget, policy, approval and audit behave identically on either.
 
+## Trust boundaries
+
+Three rules govern who gets to say a call is safe.
+
+**Risk comes from the connector.** `PolicyFacts` prefers the `CapabilitySchema`
+the connector publishes over the caller's `operation`, `readOnly` and
+`riskHints`. A caller can still raise the assessed risk, never lower it: of the
+two claims, the more dangerous wins. This closed a hole where a request naming a
+delete capability, declared as a read-only read, executed with no approval.
+
+An absent declaration is not a claim of safety. A connector that publishes no
+schemas, and a `CapabilitySchema` with `riskDeclared: false`, both leave the
+caller's declaration in force. MCP tool annotations are optional and most
+servers omit them, so `riskDeclared` records whether the server actually said
+anything rather than reading silence as either safe or dangerous.
+
+**Approvals bind to the payload.** `ApprovalGrant` and `ApprovalRecord` carry an
+`inputDigest`, a SHA-256 over canonical JSON of the request input, and
+verification refuses a payload that does not match. An approval granted for
+"send 10 to alice" no longer executes "send 1,000,000 to attacker". A grant
+issued without a digest is refused by default; `require_input_binding=False`
+opts out deliberately.
+
+**Versions are compared numerically.** Connector selection used string ordering,
+which ranked 1.9.0 above 1.10.0, so the tenth release of a connector would never
+be chosen.
+
 ## Deliberately not included
 
 - **No streaming transport.** Adding SSE means session state and resumability,
   which is a transport decision rather than a catalog one.
 - **No MCP resources or prompts.** The catalog exposes tools; there is nothing
   behind a resource list to serve yet.
+- **The data plane is still unauthenticated.** `/v1/connections/plan` and
+  `/v1/connections/execute` take the actor from the request body with no
+  authentication, so any caller that reaches the service can act as any tenant.
+  That is a contract change for every existing client and belongs in its own
+  change, not alongside these fixes.
+- **`permissionIncrease` has no connector-side source.** It stays caller-stated
+  and can only add an approval requirement.
