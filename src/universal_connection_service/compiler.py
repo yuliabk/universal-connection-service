@@ -1,10 +1,15 @@
 from uuid import uuid4
 
+from .capability_schemas import CapabilitySchema
 from .contracts import AuthRequirement, ConnectionPlan, ConnectionRequest
 from .discovery import DiscoveryEngine, DiscoveryQuery
 from .persistence import EvidenceRecord, EvidenceStore
 from .policy import DefaultPolicyEngine, PolicyEngine, PolicyFacts
 from .registry import ConnectorRegistry
+
+
+# Ordering used to pick the more dangerous of two operation claims.
+_OPERATION_RISK = {"read": 0, "create": 1, "update": 1, "execute": 2, "delete": 3}
 
 
 class ConnectionCompiler:
@@ -31,8 +36,38 @@ class ConnectionCompiler:
         # from an adapter that still has to be generated and validated.
         return "mcp" if candidate.strategy == "mcp" else "generated_api_adapter"
 
-    def _policy_facts(self, req: ConnectionRequest, *, trusted_connector: bool) -> PolicyFacts:
+    def _policy_facts(
+        self,
+        req: ConnectionRequest,
+        *,
+        trusted_connector: bool,
+        registration=None,
+    ) -> PolicyFacts:
+        """Build policy facts, preferring what the connector declares.
+
+        The caller states operation, readOnly and risk hints, and the caller is
+        the party whose request the policy is meant to constrain: a request that
+        declared a delete capability as a read-only read was allowed without
+        approval. Where the connector publishes a CapabilitySchema, that
+        declaration wins. The caller's claim can still raise the assessed risk,
+        never lower it.
+        """
         hints = req.risk_hints
+        operation = req.operation
+        read_only = req.read_only
+        destructive = hints.destructive
+        financial = hints.financial
+
+        declared = self._declared_capability(registration, req.capability)
+        if declared is not None:
+            # Whichever side says the call is more dangerous wins. The connector
+            # cannot be talked into a lower risk by the caller, and a caller who
+            # declares more than the connector published is still believed.
+            operation = max((operation, declared.operation), key=_OPERATION_RISK.__getitem__)
+            read_only = declared.read_only and req.read_only
+            destructive = declared.risk_hints.destructive or hints.destructive
+            financial = declared.risk_hints.financial or hints.financial
+
         return PolicyFacts(
             requestId=req.request_id,
             organizationId=req.actor.organization_id,
@@ -40,13 +75,33 @@ class ConnectionCompiler:
             agentId=req.actor.agent_id,
             serviceId=self.service_id(req),
             capability=req.capability,
-            operation=req.operation,
-            readOnly=req.read_only,
+            operation=operation,
+            readOnly=read_only,
             trustedConnector=trusted_connector,
-            destructive=hints.destructive,
-            financial=hints.financial,
+            destructive=destructive,
+            financial=financial,
+            # No connector-side source for this one yet; it stays caller-stated
+            # and can only add an approval requirement.
             permissionIncrease=hints.permission_increase,
         )
+
+    @staticmethod
+    def _declared_capability(registration, capability: str) -> CapabilitySchema | None:
+        """The connector's own declaration, or None when it publishes none.
+
+        The permissive fallback used elsewhere is deliberately not accepted
+        here: it describes a read-only read, and treating an absent declaration
+        as one would let a connector that says nothing downgrade a delete.
+        """
+        if registration is None:
+            return None
+        provider = getattr(registration.connector, "capability_schemas", None)
+        if not callable(provider):
+            return None
+        for schema in provider():
+            if schema.capability == capability:
+                return schema if schema.risk_declared else None
+        return None
 
     def _persist_policy_evidence(
         self,
@@ -114,7 +169,9 @@ class ConnectionCompiler:
             raise ValueError("policy evidence phase must be plan or execution")
         service_id = self.service_id(req)
         found = self.registry.trusted(service_id, req.capability, req.actor.organization_id)
-        evaluation = self.policy_engine.evaluate(self._policy_facts(req, trusted_connector=found is not None))
+        evaluation = self.policy_engine.evaluate(
+            self._policy_facts(req, trusted_connector=found is not None, registration=found)
+        )
         self._persist_policy_evidence(
             req,
             phase=phase,

@@ -67,6 +67,10 @@ class CapabilitySchema(Model):
     operation: Operation = "read"
     read_only: bool = Field(alias="readOnly", default=True)
     risk_hints: RiskHints = Field(alias="riskHints", default_factory=RiskHints)
+    # True when operation/readOnly/riskHints are the connector's own claim about
+    # this capability. False means the source said nothing, which is not the
+    # same as saying the call is safe: policy then falls back to the caller.
+    risk_declared: bool = Field(alias="riskDeclared", default=True)
     input_schema: dict[str, Any] = Field(alias="inputSchema", default_factory=permissive_envelope)
 
 
