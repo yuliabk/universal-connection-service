@@ -21,7 +21,7 @@ from universal_connection_service.contracts import (
     ServiceRef,
 )
 from universal_connection_service.persistence import AuditEvent, ConnectorStateRecord, EvidenceRecord
-from universal_connection_service.policy import ApprovalGrant
+from universal_connection_service.policy import ApprovalGrant, approval_input_digest
 from universal_connection_service.postgres_store import (
     LATEST_SCHEMA_VERSION,
     PostgresStateStore,
@@ -81,6 +81,7 @@ def grant(raw_id: str, *, request_id: str, organization_id: str):
         capability="records.write",
         operation="update",
         expiresAt=datetime.now(timezone.utc) + timedelta(minutes=5),
+        inputDigest=approval_input_digest({"secret": "must-not-enter-control-plane"}),
     )
 
 

@@ -123,7 +123,6 @@ _MIGRATIONS = (
                 capability TEXT NOT NULL,
                 operation TEXT NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
-                input_digest TEXT,
                 consumed_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL
             )
@@ -162,6 +161,16 @@ _MIGRATIONS = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_ucs_workflow_org_stage ON ucs_internal.connection_workflow (organization_id, stage, updated_at)",
+            "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
+        ),
+    ),
+    Migration(
+        4,
+        "approval_input_binding",
+        (
+            # Nullable on purpose: grants issued before this migration have no
+            # digest, and the verifier decides what to do with an unbound grant.
+            "ALTER TABLE ucs_internal.approval_grant ADD COLUMN IF NOT EXISTS input_digest TEXT",
             "REVOKE ALL ON ALL TABLES IN SCHEMA ucs_internal FROM PUBLIC",
         ),
     ),
