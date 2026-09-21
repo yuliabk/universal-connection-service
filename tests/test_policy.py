@@ -14,6 +14,7 @@ from universal_connection_service.contracts import (
 )
 from universal_connection_service.policy import (
     ApprovalGrant,
+    approval_input_digest,
     DefaultPolicyEngine,
     InMemoryApprovalVerifier,
     OPAConfig,
@@ -90,8 +91,12 @@ def grant(
     capability="records.write",
     operation="update",
     expires_at=None,
+    input_digest=None,
 ):
+    # Approvals are payload-bound; the default matches the payload `request()`
+    # sends, which is what an approver would have seen.
     return ApprovalGrant(
+        inputDigest=input_digest if input_digest is not None else approval_input_digest({"value": 1}),
         approvalId=approval_id,
         requestId=request_id,
         organizationId=organization_id,

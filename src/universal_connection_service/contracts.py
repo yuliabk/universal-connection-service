@@ -98,7 +98,9 @@ class ExecutionContext(Model):
     organization_id: str = Field(alias="organizationId")
     credential_handle: SecretStr | None = Field(alias="credentialHandle", default=None)
     approval_id: str | None = Field(alias="approvalId", default=None)
-    deadline_ms: int = Field(alias="deadlineMs", default=15000, ge=1)
+    # Bounded on purpose: an unbounded deadline lets one caller hold a worker
+    # and an upstream connection for as long as it likes.
+    deadline_ms: int = Field(alias="deadlineMs", default=15000, ge=1, le=300000)
 
 class ConnectionError(Model):
     code: str

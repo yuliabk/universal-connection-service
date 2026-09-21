@@ -7,7 +7,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import Field
 
 from .contracts import ConnectionRequest, Model, Operation
-from .policy import ApprovalGrant, ApprovalVerification
+from .policy import ApprovalGrant, ApprovalVerification, approval_input_digest
 
 
 def approval_ref_hash(approval_id: str) -> str:
@@ -25,6 +25,7 @@ class ApprovalRecord(Model):
     capability: str = Field(min_length=1)
     operation: Operation
     expires_at: datetime = Field(alias="expiresAt")
+    input_digest: str | None = Field(alias="inputDigest", default=None, min_length=64, max_length=64)
     consumed_at: datetime | None = Field(alias="consumedAt", default=None)
     created_at: datetime = Field(alias="createdAt", default_factory=lambda: datetime.now(timezone.utc))
 
@@ -40,6 +41,7 @@ class ApprovalRecord(Model):
             capability=grant.capability,
             operation=grant.operation,
             expiresAt=grant.expires_at,
+            inputDigest=grant.input_digest,
         )
 
 
@@ -67,8 +69,12 @@ class PersistentApprovalVerifier:
     consumed concurrently by multiple UCS instances.
     """
 
-    def __init__(self, store: ApprovalStore) -> None:
+    def __init__(self, store: ApprovalStore, *, require_input_binding: bool = True) -> None:
         self.store = store
+        # A grant without an input digest authorizes any payload for that
+        # request. That is refused by default: an approval for "send 10" must
+        # not execute "send 1,000,000".
+        self.require_input_binding = require_input_binding
 
     def register(self, grant: ApprovalGrant) -> ApprovalRecord:
         record = ApprovalRecord.from_grant(grant)
@@ -112,6 +118,20 @@ class PersistentApprovalVerifier:
                 valid=False,
                 code="APPROVAL_SCOPE_MISMATCH",
                 message="Approval does not match this request",
+            )
+
+        if record.input_digest is None:
+            if self.require_input_binding:
+                return ApprovalVerification(
+                    valid=False,
+                    code="APPROVAL_INPUT_UNBOUND",
+                    message="Approval is not bound to a request payload",
+                )
+        elif record.input_digest != approval_input_digest(request.input):
+            return ApprovalVerification(
+                valid=False,
+                code="APPROVAL_INPUT_MISMATCH",
+                message="Approval was granted for a different request payload",
             )
         return ApprovalVerification(valid=True, code="APPROVAL_VALID", message="Approval is valid")
 

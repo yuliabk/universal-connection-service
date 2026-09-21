@@ -356,12 +356,18 @@ def _capability_schema_for(
     snapshot = next((item for item in tools if item.name == chosen), None)
     if snapshot is None or snapshot.input_schema is None:
         return None
+    declared = snapshot.read_only_hint is not None or snapshot.destructive_hint is not None
     return CapabilitySchema(
         capability=capability,
         description=snapshot.description or snapshot.title or chosen,
         operation="read" if snapshot.read_only_hint else "execute",
         readOnly=bool(snapshot.read_only_hint),
         riskHints=RiskHints(destructive=bool(snapshot.destructive_hint)),
+        # Tool annotations are optional in MCP and most servers omit them.
+        # Treating silence as "not read-only" would send every unannotated tool
+        # to human approval; treating it as "read-only" would hide a delete.
+        # It is recorded as undeclared instead.
+        riskDeclared=declared,
         inputSchema=snapshot.input_schema,
     )
 

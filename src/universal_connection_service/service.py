@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from uuid import uuid4
 
 from .compiler import ConnectionCompiler
@@ -8,6 +9,8 @@ from .contracts import ConnectionError, ConnectionRequest, ConnectionResult, Exe
 from .discovery import DiscoveryEngine
 from .persistence import AuditEvent, AuditStore, EvidenceRecord, EvidenceStore
 from .policy import ApprovalVerifier, PolicyEngine
+
+logger = logging.getLogger(__name__)
 from .registry import ConnectorRegistry
 
 
@@ -127,6 +130,7 @@ class ConnectionService:
         connector_id: str | None = None,
         policy_decision: str | None = None,
         approval_id: str | None = None,
+        retryable: bool = False,
     ) -> ConnectionResult:
         return self._result(
             req,
@@ -137,6 +141,7 @@ class ConnectionService:
                 code=code,
                 message=message,
                 userActionRequired=user_action,
+                retryable=retryable,
             ),
             policy_decision=policy_decision,
             approval_id=approval_id,
@@ -289,7 +294,28 @@ class ConnectionService:
         )
         if not item:
             raise RuntimeError("registry changed during execution")
-        result = await item.connector.execute(req.capability, req.input, ctx)
+        try:
+            result = await item.connector.execute(req.capability, req.input, ctx)
+        except Exception as exc:
+            # A connector that raises used to propagate out of the service, so
+            # the caller saw an exception instead of a result and the attempt
+            # was never audited. Upstream failures are ordinary outcomes.
+            logger.warning(
+                "connector_execution_failed connector_id=%s capability=%s exception=%s",
+                item.manifest.connector_id,
+                req.capability,
+                type(exc).__name__,
+            )
+            return self._failed(
+                req,
+                plan.service_id,
+                "CONNECTOR_EXECUTION_FAILED",
+                "The connector failed while executing this request",
+                connector_id=item.manifest.connector_id,
+                policy_decision=plan.policy_decision,
+                approval_id=ctx.approval_id,
+                retryable=True,
+            )
         return self._result(
             req,
             plan.service_id,

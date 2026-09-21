@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import Field, SecretStr
 
 from .approvals import ApprovalRecord, ApprovalStore, approval_ref_hash
+from .policy import approval_input_digest
 from .contracts import ConnectionPlan, ConnectionRequest, ConnectionResult, DiscoveryCandidateRef, ExecutionContext, Model
 from .control_plane import (
     ControlPlaneError,
@@ -526,6 +527,8 @@ class AutoConnectOrchestrator:
                 capability=request.capability,
                 operation=request.operation,
                 expiresAt=expires_at,
+                # The approver saw this payload; the grant is bound to it.
+                inputDigest=approval_input_digest(request.input),
             )
         )
         if self.evidence_store is not None:

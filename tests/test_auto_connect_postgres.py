@@ -25,10 +25,14 @@ def config(*, auto_migrate=True):
     )
 
 
-def test_postgres_v3_persists_workflow_and_claim_is_atomic_across_instances():
+def test_postgres_workflow_persists_and_claim_is_atomic_across_instances():
     store1 = PostgresStateStore(config(auto_migrate=True))
     store2 = PostgresStateStore(config(auto_migrate=False))
-    assert store1.schema_version() == LATEST_SCHEMA_VERSION == 3
+    # The point is that migration reaches the latest version, not that the
+    # latest version is a particular number: pinning it made every new
+    # migration break this test.
+    assert store1.schema_version() == LATEST_SCHEMA_VERSION
+    assert LATEST_SCHEMA_VERSION >= 3  # the workflow tables arrived in v3
 
     suffix = uuid4().hex
     organization_id = f"org-wf-{suffix}"

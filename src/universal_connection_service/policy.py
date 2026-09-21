@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
-from typing import Literal, Protocol, runtime_checkable
+from hashlib import sha256
+from typing import Any, Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 import httpx
@@ -10,6 +12,19 @@ from pydantic import Field, field_validator
 from .contracts import ConnectionRequest, Model, Operation, RiskAssessment
 
 PolicyOutcome = Literal["ALLOW", "DENY", "REQUIRE_APPROVAL"]
+
+
+def approval_input_digest(value: Any) -> str:
+    """Digest of the payload an approval is granted for.
+
+    Canonical JSON: sorted keys and fixed separators, so the same payload
+    always produces the same digest regardless of key order or formatting.
+    The digest is one-way, so it can be stored and logged without carrying the
+    payload itself.
+    """
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
 
 
 class PolicyFacts(Model):
@@ -203,6 +218,10 @@ class ApprovalGrant(Model):
     capability: str = Field(min_length=1)
     operation: Operation
     expires_at: datetime = Field(alias="expiresAt")
+    # Binds the grant to the exact payload a human approved. Optional on the
+    # model so an operator can issue an unbound grant deliberately; the verifier
+    # decides whether an unbound grant is acceptable.
+    input_digest: str | None = Field(alias="inputDigest", default=None, min_length=64, max_length=64)
 
 
 class ApprovalVerification(Model):
@@ -229,9 +248,15 @@ class InMemoryApprovalVerifier:
     replace this with a persistent approval service/store.
     """
 
-    def __init__(self, grants: tuple[ApprovalGrant, ...] = ()) -> None:
+    def __init__(
+        self,
+        grants: tuple[ApprovalGrant, ...] = (),
+        *,
+        require_input_binding: bool = True,
+    ) -> None:
         self._grants = {grant.approval_id: grant for grant in grants}
         self._consumed: set[str] = set()
+        self.require_input_binding = require_input_binding
 
     async def verify(self, approval_id: str, request: ConnectionRequest) -> ApprovalVerification:
         if approval_id in self._consumed:
@@ -269,6 +294,20 @@ class InMemoryApprovalVerifier:
                 valid=False,
                 code="APPROVAL_SCOPE_MISMATCH",
                 message="Approval does not match this request",
+            )
+
+        if grant.input_digest is None:
+            if self.require_input_binding:
+                return ApprovalVerification(
+                    valid=False,
+                    code="APPROVAL_INPUT_UNBOUND",
+                    message="Approval is not bound to a request payload",
+                )
+        elif grant.input_digest != approval_input_digest(request.input):
+            return ApprovalVerification(
+                valid=False,
+                code="APPROVAL_INPUT_MISMATCH",
+                message="Approval was granted for a different request payload",
             )
         return ApprovalVerification(valid=True, code="APPROVAL_VALID", message="Approval is valid")
 
